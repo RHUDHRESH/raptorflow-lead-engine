@@ -165,18 +165,21 @@ export default function Dashboard() {
                   {totalLeads > 0
                     ? (((counts.red_hot + counts.warm) / totalLeads) * 100).toFixed(1)
                     : 0}
-                  % of pipeline
+                  % urgent
                 </p>
               </div>
 
               <div>
-                <p className="text-slate-400 text-sm mb-2">Conversion Potential</p>
+                <p className="text-slate-400 text-sm mb-2">Active Pipeline</p>
                 <div className="flex items-end gap-2">
-                  <p className="text-3xl font-bold text-blue-400">
-                    {counts.red_hot > 0 ? Math.round((counts.red_hot / totalLeads) * 100) : 0}
+                  <p className="text-3xl font-bold text-green-400">
+                    {counts.red_hot + counts.warm + counts.nurture}
                   </p>
-                  <p className="text-slate-400 text-sm pb-1">% red hot</p>
+                  <p className="text-slate-400 text-xs pb-1 mb-1">
+                     ({totalLeads > 0 ? Math.round(((counts.red_hot + counts.warm + counts.nurture) / totalLeads) * 100) : 0}%)
+                  </p>
                 </div>
+                <p className="text-xs text-slate-500 mt-1">Excludes parked</p>
               </div>
             </div>
           </motion.div>

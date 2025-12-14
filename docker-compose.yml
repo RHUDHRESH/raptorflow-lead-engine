@@ -1,0 +1,111 @@
+version: '3.8'
+
+services:
+  # Main application
+  raptorflow-app:
+    build: .
+    ports:
+      - "3000:3000"  # Frontend
+      - "8000:8000"  # Backend API
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@raptorflow-db:5432/raptorflow
+      - REDIS_URL=redis://raptorflow-redis:6379/0
+      - OLLAMA_BASE_URL=http://raptorflow-ollama:11434
+      - HOST=0.0.0.0
+      - DEBUG=false
+    depends_on:
+      - raptorflow-db
+      - raptorflow-redis
+      - raptorflow-ollama
+    volumes:
+      - ./backend:/app/backend
+      - ./app:/app/app
+      - ./components:/app/components
+      - ./lib:/app/lib
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # PostgreSQL database
+  raptorflow-db:
+    image: postgres:15-alpine
+    environment:
+      - POSTGRES_DB=raptorflow
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./backend/init.sql:/docker-entrypoint-initdb.d/init.sql
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # Redis for caching
+  raptorflow-redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # Ollama service (optional - can use external)
+  raptorflow-ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    restart: unless-stopped
+    environment:
+      - OLLAMA_HOST=0.0.0.0
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  # Monitoring stack (optional)
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3001:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - grafana_data:/var/lib/grafana
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+
+volumes:
+  postgres_data:
+  redis_data:
+  ollama_data:
+  prometheus_data:
+  grafana_data:
+

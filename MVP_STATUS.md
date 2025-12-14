@@ -269,51 +269,358 @@ Frontend live at **http://localhost:3000**
 
 ---
 
-## Testing Workflows
+## Testing Workflows (Step-by-Step)
 
-### Workflow 1: Create an ICP, then classify a signal
+### Workflow 1: Start Stack (Prerequisite)
 
-```bash
-# 1. Create ICP
-curl -X POST http://localhost:8000/api/icp/ \
-  -H "Content-Type: application/json" \
-  -d '{
-    "name": "Solo Founder",
-    "size_buckets": ["1", "2-5"],
-    "industries": ["ecommerce", "d2c"],
-    "hiring_keywords": ["marketing manager", "growth hacker"],
-    "pain_keywords": ["lead generation", "scaling"]
-  }'
+**Purpose:** Verify all services start without errors.
 
-# 2. Classify a job post
-curl -X POST http://localhost:8000/api/classify/signal \
-  -H "Content-Type: application/json" \
-  -d '{
-    "signal_text": "Hiring: Growth Marketer for D2C brand, no marketing team",
-    "company_name": "MyBrand"
-  }'
+**Steps:**
 
-# 3. View the lead
-curl http://localhost:8000/api/leads/1
-```
+1. **Terminal 1 – Start Ollama:**
+   ```bash
+   ollama serve
+   ```
+   - Wait for: `Listening on 127.0.0.1:11434`
+   - First time: May take 30s to start.
 
-### Workflow 2: Drop a business card image
+2. **Terminal 2 – Start Backend:**
+   ```bash
+   cd backend
+   python main.py
+   ```
+   - Expected output:
+     ```
+     🚀 Initializing Raptorflow Lead Engine...
+     📡 Checking Ollama models...
+     ✅ System ready!
+     INFO: Uvicorn running on http://127.0.0.1:8000
+     ```
+   - If it hangs on "Checking Ollama models": Ollama not running. Go back to step 1.
+   - If it fails with SQLite error: Delete `raptorflow_leads.db` and retry.
 
-1. Go to http://localhost:3000
-2. Click "OCR Ingest" tab
-3. Drag-drop a business card image
-4. See extracted text + classification + lead created
+3. **Terminal 3 – Start Frontend:**
+   ```bash
+   npm install  # First time only
+   npm run dev
+   ```
+   - Expected: `▲ Next.js ready on http://localhost:3000`
 
-### Workflow 3: Bulk upload CSV
+4. **Browser:** Open http://localhost:3000
+   - Header should show "Backend Ready" (green indicator).
+   - If red: Backend not reachable. Check Terminal 2.
 
-```bash
-# Create a CSV (company_name, company_website, signal_text)
-# Upload via API
-curl -X POST http://localhost:8000/api/ingest/csv \
-  -F "file=@leads.csv"
-```
+**Expected Result:** All three services running, no errors in terminals.
 
-All rows classified, leads created with scores.
+---
+
+### Workflow 2: Manual Signal Classification
+
+**Purpose:** Test core classification pipeline (1B model).
+
+**Steps:**
+
+1. **API Call – Strong Signal (should score high):**
+   ```bash
+   curl -X POST http://localhost:8000/api/classify/signal \
+     -H "Content-Type: application/json" \
+     -d '{
+       "signal_text": "Hiring: Growth Marketer. We are a 5-person D2C skincare brand doing $50K MRR. Looking for someone to own our Instagram, email, and paid ads. No marketing team yet. Founder-led.",
+       "source_type": "job_post",
+       "company_name": "SkinLab",
+       "company_website": "https://skinlab.com"
+     }'
+   ```
+   - **Expected:**
+     - HTTP 200
+     - `"total_score": >= 70`
+     - `"score_bucket": "red_hot"`
+     - `"icp_match": true`
+     - `"role_type": "first_marketer"`
+
+2. **API Call – Weak Signal (should score low):**
+   ```bash
+   curl -X POST http://localhost:8000/api/classify/signal \
+     -H "Content-Type: application/json" \
+     -d '{
+       "signal_text": "We are hiring for various roles. Send resumes.",
+       "company_name": "Generic Corp"
+     }'
+   ```
+   - **Expected:**
+     - HTTP 200
+     - `"total_score": < 40`
+     - `"score_bucket": "parked"`
+     - `"icp_match": false`
+
+3. **Check Frontend – Leads List:**
+   - Go to http://localhost:3000 → **Leads** tab
+   - You should see 2 leads:
+     - SkinLab (red_hot, score ~75+)
+     - Generic Corp (parked, score ~10)
+   - Click SkinLab lead:
+     - Shows score breakdown
+     - Shows pain_tags
+     - If score >= 70, should have `context_dossier` (may be empty if 4B is slow)
+
+4. **Update Status:**
+   - Click SkinLab lead
+   - Change status dropdown from "new" to "contacted"
+   - Confirm it saves (no error)
+   - Refresh page; status still "contacted"
+
+5. **Delete Lead:**
+   - Click Generic Corp lead
+   - Click "Delete" button
+   - Confirm dialog
+   - Lead disappears from list
+   - Refresh; still gone
+
+**Expected Result:** Both leads created, can update status and delete. Scores make sense.
+
+---
+
+### Workflow 3: OCR Image Ingest
+
+**Purpose:** Test image OCR → automatic classification.
+
+**Steps:**
+
+1. **Prepare Image:**
+   - Use any image with text (business card, screenshot, document photo).
+   - Save as `test_card.jpg` or similar.
+
+2. **Frontend Upload:**
+   - Go to http://localhost:3000 → **OCR Ingest** tab
+   - Drag-drop `test_card.jpg` into upload area
+   - Wait for spinner to complete
+
+3. **Expected Results:**
+   - "Extracted Text" box shows readable text (non-empty)
+   - "Classification Complete" appears
+   - Score visible (0-100)
+   - Bucket displayed (red_hot / warm / etc.)
+   - Button: "View in Leads" (or similar)
+
+4. **Verify in UI:**
+   - Go to **Leads** tab
+   - New lead should appear at top (sorted by score)
+   - Click it; check:
+     - Company name auto-detected or blank
+     - Source type shows "ocr_image"
+     - Scores populated
+
+**Expected Result:** Image OCR works, lead created, visible in leads list.
+
+---
+
+### Workflow 4: OCR PDF Ingest
+
+**Purpose:** Test PDF text extraction → classification.
+
+**Steps:**
+
+1. **Prepare PDF:**
+   - Use a text-based PDF (e.g., a proposal, job posting, or any document with readable text).
+   - Save as `test_doc.pdf`.
+
+2. **Frontend Upload:**
+   - Go to http://localhost:3000 → **OCR Ingest** tab
+   - Drag-drop `test_doc.pdf` into upload area
+   - Wait for spinner
+
+3. **Expected Results:**
+   - "Extracted Text" shows multi-line text
+   - Classification completes (may take 3-5s)
+   - Score and bucket displayed
+   - No error message
+
+4. **Verify in Leads:**
+   - Go to **Leads** tab
+   - New lead present with source "ocr_pdf"
+
+**Known Limitation:**
+- Scanned PDFs (image-only) will not extract text. Document this in limitations.
+
+**Expected Result:** Text PDF works. Scanned PDF noted as limitation.
+
+---
+
+### Workflow 5: CSV Bulk Ingest
+
+**Purpose:** Test batch classification.
+
+**Steps:**
+
+1. **Prepare CSV:**
+   - Create `test_leads.csv`:
+     ```csv
+     company_name,company_website,signal_text
+     BrandA,https://branda.com,"Hiring: Growth Manager. We are a D2C brand."
+     BrandB,https://brandb.com,"We need help with marketing."
+     BrandC,,Vague text that might not match any ICP.
+     ```
+
+2. **API Upload:**
+   ```bash
+   curl -X POST http://localhost:8000/api/ingest/csv \
+     -F "file=@test_leads.csv"
+   ```
+   - **Expected:**
+     - HTTP 200
+     - `"total_processed": 3`
+     - `"total_created": 3` (or close)
+     - `"results"` array with each row's status
+
+3. **Verify in Leads:**
+   - Go to **Leads** tab
+   - 3 new leads should appear
+   - Check their scores (BrandA should be higher than BrandC)
+
+**Expected Result:** All 3 rows processed, leads created with varied scores.
+
+---
+
+### Workflow 6: ICP Management
+
+**Purpose:** Test ICP creation and usage in classification.
+
+**Steps:**
+
+1. **Create ICP #1 – Solo Founder:**
+   ```bash
+   curl -X POST http://localhost:8000/api/icp/ \
+     -H "Content-Type: application/json" \
+     -d '{
+       "name": "Solo Founder D2C",
+       "description": "Single founder running D2C brand",
+       "size_buckets": ["1"],
+       "industries": ["ecommerce", "d2c"],
+       "locations": ["india"],
+       "hiring_keywords": ["marketing manager", "growth hacker"],
+       "pain_keywords": ["lead generation", "scaling"]
+     }'
+   ```
+   - Expected: HTTP 201, ICP created with id=1
+
+2. **Create ICP #2 – Small Agency:**
+   ```bash
+   curl -X POST http://localhost:8000/api/icp/ \
+     -H "Content-Type: application/json" \
+     -d '{
+       "name": "Small Agency",
+       "size_buckets": ["6-10", "11-20"],
+       "industries": ["agency", "consulting"],
+       "locations": ["india"],
+       "hiring_keywords": ["account manager", "designer"],
+       "pain_keywords": ["client retention", "scaling"]
+     }'
+   ```
+
+3. **Classify Signal Matching ICP #1:**
+   ```bash
+   curl -X POST http://localhost:8000/api/classify/signal \
+     -H "Content-Type: application/json" \
+     -d '{
+       "signal_text": "Solo founder, D2C brand, hiring growth hacker",
+       "company_name": "SoloFounder Inc"
+     }'
+   ```
+   - Expected: `"icp_match": true`, high score
+
+4. **Frontend – ICP Whiteboard:**
+   - Go to http://localhost:3000 → **ICP Whiteboard** tab
+   - Should see 2 ICPs listed: "Solo Founder D2C" and "Small Agency"
+   - Click one; see its config (size, industries, etc.)
+
+5. **Delete an ICP:**
+   - (If UI supports delete) Delete "Small Agency"
+   - Confirm removal
+   - Re-classify signal; should not match "Small Agency" (if it was used)
+
+**Expected Result:** ICPs created, listed, and used in classification pipeline.
+
+---
+
+### Workflow 7: Lead Lifecycle
+
+**Purpose:** Test full lead status journey.
+
+**Steps:**
+
+1. **Create 2 Test Leads:**
+   ```bash
+   # Lead A
+   curl -X POST http://localhost:8000/api/classify/signal \
+     -H "Content-Type: application/json" \
+     -d '{"signal_text": "Hiring growth marketer", "company_name": "CompanyA"}'
+
+   # Lead B
+   curl -X POST http://localhost:8000/api/classify/signal \
+     -H "Content-Type: application/json" \
+     -d '{"signal_text": "Hiring growth marketer", "company_name": "CompanyB"}'
+   ```
+   - Note the `lead_id` from each response.
+
+2. **Update Lead A Status Path:**
+   ```bash
+   # new → contacted
+   curl -X PATCH http://localhost:8000/api/leads/1/status \
+     -H "Content-Type: application/json" \
+     -d '{"status": "contacted"}'
+
+   # contacted → qualified
+   curl -X PATCH http://localhost:8000/api/leads/1/status \
+     -H "Content-Type: application/json" \
+     -d '{"status": "qualified"}'
+
+   # qualified → pitched
+   curl -X PATCH http://localhost:8000/api/leads/1/status \
+     -H "Content-Type: application/json" \
+     -d '{"status": "pitched"}'
+
+   # pitched → won
+   curl -X PATCH http://localhost:8000/api/leads/1/status \
+     -H "Content-Type: application/json" \
+     -d '{"status": "won"}'
+   ```
+   - Expected: Each returns HTTP 200
+
+3. **Update Lead B Status to "lost":**
+   ```bash
+   curl -X PATCH http://localhost:8000/api/leads/2/status \
+     -H "Content-Type: application/json" \
+     -d '{"status": "lost"}'
+   ```
+
+4. **Verify Frontend:**
+   - Go to **Leads** tab
+   - CompanyA shows status "won"
+   - CompanyB shows status "lost"
+   - Refresh page; statuses persist
+
+5. **Delete Lead A:**
+   ```bash
+   curl -X DELETE http://localhost:8000/api/leads/1
+   ```
+   - Expected: HTTP 200
+   - Refresh **Leads** tab; Lead A gone, Lead B still there
+
+**Expected Result:** Full lifecycle works without errors. Statuses persist across refresh.
+
+---
+
+## Dashboard & Summary
+
+1. **Go to Dashboard:**
+   - http://localhost:3000 → **Dashboard** tab
+   - Should show lead counts by bucket
+   - If you've created ~10 leads, should see distribution
+
+2. **Overall Health Check:**
+   - No console errors (F12 → Console)
+   - No backend errors in terminal
+   - All UI interactions are responsive (not frozen)
 
 ---
 

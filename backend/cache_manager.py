@@ -74,6 +74,69 @@ class CacheManager:
 
         logger.info(f"CacheManager initialized with backend={self.backend}, max_size={max_size}, ttl={ttl_seconds}s")
 
+    def get_sync(
+        self,
+        signal_text: str,
+        icp_context: Optional[str] = None,
+        model: str = "1b"
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Synchronous retrieval from cache (Memory backend only).
+        If using Redis backend, this returns None to avoid blocking async calls.
+        """
+        if self.backend != "memory":
+            return None
+
+        cache_key = self._generate_cache_key(signal_text, icp_context, model)
+        
+        try:
+            if cache_key in self._memory_cache:
+                entry = self._memory_cache[cache_key]
+                if datetime.now() < entry["expires_at"]:
+                    self.hits += 1
+                    logger.debug(f"Cache HIT (Memory Sync): {cache_key[:16]}...")
+                    return entry["value"]
+                else:
+                    del self._memory_cache[cache_key]
+                    self.misses += 1
+                    return None
+            else:
+                self.misses += 1
+                return None
+        except Exception as e:
+            logger.error(f"Cache GET SYNC error: {e}")
+            return None
+
+    def set_sync(
+        self,
+        signal_text: str,
+        value: Dict[str, Any],
+        icp_context: Optional[str] = None,
+        model: str = "1b",
+        ttl: Optional[int] = None
+    ):
+        """
+        Synchronous storage in cache (Memory backend only).
+        """
+        if self.backend != "memory":
+            return
+
+        cache_key = self._generate_cache_key(signal_text, icp_context, model)
+        ttl = ttl or self.ttl_seconds
+
+        try:
+            if len(self._memory_cache) >= self.max_size:
+                oldest_key = next(iter(self._memory_cache))
+                del self._memory_cache[oldest_key]
+
+            self._memory_cache[cache_key] = {
+                "value": value,
+                "expires_at": datetime.now() + timedelta(seconds=ttl)
+            }
+            logger.debug(f"Cache SET (Memory Sync): {cache_key[:16]}...")
+        except Exception as e:
+            logger.error(f"Cache SET SYNC error: {e}")
+
     async def connect_redis(self):
         """Connect to Redis (call during app startup)."""
         if self.backend == "redis" and REDIS_AVAILABLE and self.redis_url:

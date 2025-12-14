@@ -1,0 +1,236 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: raptorflow-app
+  namespace: raptorflow
+  labels:
+    app: raptorflow
+    tier: application
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: raptorflow
+      tier: application
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: raptorflow
+        tier: application
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+      - name: raptorflow-backend
+        image: raptorflow-app:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8000
+          name: api
+        - containerPort: 3000
+          name: frontend
+        env:
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: raptorflow-secrets
+              key: database-url
+        - name: REDIS_URL
+          value: "redis://raptorflow-redis:6379/0"
+        - name: OLLAMA_BASE_URL
+          value: "http://raptorflow-ollama:11434"
+        - name: HOST
+          value: "0.0.0.0"
+        - name: DEBUG
+          value: "false"
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "1Gi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 1
+        volumeMounts:
+        - name: config-volume
+          mountPath: /app/backend/.env
+          subPath: .env
+      volumes:
+      - name: config-volume
+        configMap:
+          name: raptorflow-config
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - raptorflow
+              topologyKey: kubernetes.io/hostname
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: raptorflow-service
+  namespace: raptorflow
+  labels:
+    app: raptorflow
+    tier: application
+spec:
+  selector:
+    app: raptorflow
+    tier: application
+  ports:
+  - name: api
+    port: 8000
+    targetPort: 8000
+    protocol: TCP
+  - name: frontend
+    port: 3000
+    targetPort: 3000
+    protocol: TCP
+  type: ClusterIP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: raptorflow-db
+  namespace: raptorflow
+  labels:
+    app: raptorflow
+    tier: database
+spec:
+  selector:
+    app: postgres
+    tier: database
+  ports:
+  - port: 5432
+    targetPort: 5432
+    protocol: TCP
+  type: ClusterIP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: raptorflow-redis
+  namespace: raptorflow
+  labels:
+    app: raptorflow
+    tier: cache
+spec:
+  selector:
+    app: redis
+    tier: cache
+  ports:
+  - port: 6379
+    targetPort: 6379
+    protocol: TCP
+  type: ClusterIP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: raptorflow-ollama
+  namespace: raptorflow
+  labels:
+    app: raptorflow
+    tier: ai
+spec:
+  selector:
+    app: ollama
+    tier: ai
+  ports:
+  - port: 11434
+    targetPort: 11434
+    protocol: TCP
+  type: ClusterIP
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: raptorflow-ingress
+  namespace: raptorflow
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+spec:
+  tls:
+  - hosts:
+    - raptorflow.example.com
+    secretName: raptorflow-tls
+  rules:
+  - host: raptorflow.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: raptorflow-service
+            port:
+              number: 3000
+      - path: /api
+        pathType: Prefix
+        backend:
+          service:
+            name: raptorflow-service
+            port:
+              number: 8000
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: raptorflow-config
+  namespace: raptorflow
+data:
+  .env: |
+    HOST=0.0.0.0
+    PORT=8000
+    DEBUG=false
+    OLLAMA_BASE_URL=http://raptorflow-ollama:11434
+    CACHE_BACKEND=redis
+    REDIS_URL=redis://raptorflow-redis:6379/0
+    ENABLE_STREAMING=true
+    ENABLE_GPU_ACCELERATION=true
+    GPU_BACKEND=cuda
+    USE_QUANTIZED_MODELS=true
+    ENABLE_HEALTH_MONITORING=true
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: raptorflow-secrets
+  namespace: raptorflow
+type: Opaque
+data:
+  database-url: cG9zdGdyZXNxbDovL3Bvc3RncmVzOnBvc3RncmVzQHJhcHRvcmZsb3ctZGI6NTQzMi9yYXB0b3JmbG93
+  # echo -n "postgresql://postgres:postgres@raptorflow-db:5432/raptorflow" | base64
+

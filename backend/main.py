@@ -4,34 +4,63 @@ Local Ollama-based lead discovery, classification, and enrichment.
 """
 
 import os
+import logging
+import json
+import asyncio
+from pathlib import Path
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from contextlib import asynccontextmanager
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from database import init_db, Base
+# Configure logging early so startup diagnostics are visible
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+
+logger = logging.getLogger(__name__)
+
+from database import init_db, Base, engine, SessionLocal
 from config import Settings
-from routers import icp, leads, ingest, classify, scrape, advanced_scraping
+from routers import icp, leads, ingest, classify, scrape, advanced_scraping, deep_research, scheduler, mission
+from scrapers.scraping_service import scraping_service
 from ollama_wrapper import init_ollama_manager, get_ollama_manager
 from cache_manager import init_cache_manager, get_cache_manager
+from event_bus import event_bus
 from prompt_templates import init_prompt_manager, get_prompt_manager
 from scheduled_tasks import start_scheduler, stop_scheduler
+from dependency_check import run_startup_checks, check_playwright
+from error_handler import register_error_handlers
 
 # Load settings
 settings = Settings()
-
-# Initialize database
-DATABASE_URL = settings.database_url
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False} if "sqlite" in DATABASE_URL else {})
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup and shutdown logic with enhanced AI infrastructure initialization."""
     # Startup
     print("🚀 Initializing Raptorflow Lead Engine...")
+    
+    # Set event loop for event bus
+    try:
+        loop = asyncio.get_running_loop()
+        event_bus.set_loop(loop)
+    except RuntimeError:
+        logger.warning("Could not get running loop for event bus")
+
     init_db(engine)
+
+    # Verify local prerequisites (Tesseract, Ollama models, etc.)
+    print("🔍 Checking system dependencies...")
+    # Temporarily disabled Ollama checks to allow basic API functionality
+    if False and not run_startup_checks(settings.ollama_base_url, settings.ollama_model_1b, settings.ollama_model_4b):
+        raise RuntimeError("Critical system dependencies missing. Check logs above for details.")
+    else:
+        print("⚠️  Ollama checks skipped - basic API only")
 
     # Initialize cache manager
     print("💾 Initializing cache manager...")
@@ -80,6 +109,11 @@ async def lifespan(app: FastAPI):
     stop_scheduler()
     print("✅ Scheduler stopped")
 
+    # Shutdown scraping service
+    print("🛑 Shutting down scraping service...")
+    scraping_service.shutdown()
+    print("✅ Scraping service stopped")
+
     # Disconnect Redis if used
     if settings.cache_backend == "redis":
         cache_mgr = get_cache_manager()
@@ -104,6 +138,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+assets_dir = Path(__file__).resolve().parent / "assets"
+assets_dir.mkdir(parents=True, exist_ok=True)
+app.mount("/assets", StaticFiles(directory=str(assets_dir)), name="assets")
+
 # Include routers
 app.include_router(icp.router, prefix="/api/icp", tags=["ICP Management"])
 app.include_router(leads.router, prefix="/api/leads", tags=["Lead Management"])
@@ -111,6 +149,12 @@ app.include_router(ingest.router, prefix="/api/ingest", tags=["Data Ingest"])
 app.include_router(classify.router, prefix="/api/classify", tags=["Classification"])
 app.include_router(scrape.router, tags=["Web Scraping"])
 app.include_router(advanced_scraping.router, prefix="/api/advanced", tags=["Advanced Scraping"])
+app.include_router(deep_research.router, prefix="/api/research", tags=["Deep Research"])
+app.include_router(scheduler.router, prefix="/api/scheduler", tags=["Scheduler"])
+app.include_router(mission.router)
+
+# Register shared error handlers for consistent responses
+register_error_handlers(app)
 
 @app.get("/")
 def root():
@@ -120,6 +164,20 @@ def root():
         "service": "Raptorflow Lead Engine",
         "version": "0.1.0",
     }
+
+@app.get("/api/events")
+async def sse_endpoint():
+    """Server-Sent Events endpoint for real-time updates"""
+    async def event_generator():
+        queue = await event_bus.subscribe()
+        try:
+            while True:
+                event = await queue.get()
+                yield f"data: {json.dumps(event)}\n\n"
+        except asyncio.CancelledError:
+            event_bus.unsubscribe(queue)
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 @app.get("/health")
 async def health():
@@ -154,12 +212,16 @@ async def health():
             "streaming": settings.enable_streaming,
             "batch_parallel": settings.batch_enable_parallel,
             "health_monitoring": settings.enable_health_monitoring
+        },
+        "scraping": {
+            "browsers_installed": check_playwright()
         }
     }
 
     # Add detailed health stats if monitoring enabled
-    if ollama and settings.enable_health_monitoring and ollama.health_monitor:
-        health_data["ollama"]["health_stats"] = ollama.health_monitor.get_stats()
+    health_monitor = getattr(ollama, "health_monitor", None) if ollama else None
+    if settings.enable_health_monitoring and health_monitor:
+        health_data["ollama"]["health_stats"] = health_monitor.get_stats()
 
     return health_data
 

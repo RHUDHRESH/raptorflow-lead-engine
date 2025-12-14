@@ -6,7 +6,7 @@ from pydantic import BaseModel, HttpUrl
 from typing import List, Optional, Dict, Any
 import logging
 
-from ..scrapers.scraping_service import scraping_service
+from scrapers.scraping_service import scraping_service
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +41,17 @@ class CareerPageScrapeRequest(BaseModel):
     company_name: str
 
 
+class StartupScrapeRequest(BaseModel):
+    """Request for scraping startup listings"""
+    source: str = "ycombinator"
+    query: Optional[str] = ""
+
+
+class CustomUrlsRequest(BaseModel):
+    """Request for scraping custom URLs"""
+    urls: List[HttpUrl]
+
+
 @router.post("/job-boards", summary="Scrape job boards for leads")
 async def scrape_job_boards(
     request: JobBoardScrapeRequest,
@@ -49,8 +60,8 @@ async def scrape_job_boards(
     """
     Scrape multiple job boards for job postings and create leads
 
-    This endpoint scrapes job boards (Indeed, Naukri, LinkedIn) for job postings
-    matching your query, then classifies them and creates leads automatically.
+    This endpoint launches background tasks to scrape job boards (Indeed, Naukri, LinkedIn).
+    It returns immediately with a confirmation.
 
     **Parameters:**
     - **query**: Job search query (e.g., "marketing manager", "growth hacker")
@@ -59,23 +70,14 @@ async def scrape_job_boards(
     - **num_pages**: Number of pages to scrape per source (default: 3)
 
     **Returns:**
-    - Results summary with jobs found and leads created
-
-    **Example:**
-    ```json
-    {
-        "query": "marketing manager",
-        "location": "Mumbai",
-        "sources": ["indeed", "naukri"],
-        "num_pages": 3
-    }
-    ```
+    - Status message indicating scrape has started
     """
     try:
-        logger.info(f"Starting job board scrape: {request.query}")
+        logger.info(f"Starting job board scrape background task: {request.query}")
 
         # Run scraping in background
-        results = scraping_service.scrape_job_boards(
+        background_tasks.add_task(
+            scraping_service.scrape_job_boards,
             query=request.query,
             location=request.location or "",
             sources=request.sources,
@@ -83,156 +85,198 @@ async def scrape_job_boards(
         )
 
         return {
-            "status": "completed",
-            "message": f"Scraped {results['total_jobs']} jobs, created {results['total_leads_created']} leads",
-            "results": results
+            "status": "started",
+            "message": f"Job board scrape for '{request.query}' started in background.",
+            "details": {
+                "sources": request.sources or ["indeed", "naukri"],
+                "pages": request.num_pages or 3
+            }
         }
 
     except Exception as e:
-        logger.error(f"Error in job board scraping: {e}")
+        logger.error(f"Error queuing job board scrape: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.post("/company-website", summary="Scrape company website")
 async def scrape_company_website(
-    request: CompanyScrapeRequest
+    request: CompanyScrapeRequest,
+    background_tasks: BackgroundTasks
 ) -> Dict[str, Any]:
     """
     Scrape a company website for contact info and hiring signals
 
-    This endpoint crawls a company website to extract:
-    - Contact emails and phone numbers
-    - Career page URLs
-    - Job postings and hiring signals
-    - Social media links
-    - Technologies used
-    - Company size hints
+    Launches a background task to crawl the company website.
 
     **Parameters:**
     - **url**: Company website URL
-    - **company_name**: Optional company name (auto-detected if not provided)
-    - **deep_scan**: If true, also crawls career and contact pages (slower but more thorough)
+    - **company_name**: Optional company name
+    - **deep_scan**: If true, also crawls career and contact pages
 
     **Returns:**
-    - Company data with contact info and any leads created
-
-    **Example:**
-    ```json
-    {
-        "url": "https://example.com",
-        "company_name": "Example Corp",
-        "deep_scan": true
-    }
-    ```
+    - Status message
     """
     try:
-        logger.info(f"Starting company website scrape: {request.url}")
+        logger.info(f"Starting company website scrape background task: {request.url}")
 
-        results = scraping_service.scrape_company_website(
+        background_tasks.add_task(
+            scraping_service.scrape_company_website,
             url=str(request.url),
             company_name=request.company_name,
             deep_scan=request.deep_scan or False
         )
 
         return {
-            "status": "completed",
-            "message": f"Scraped {request.url}, created {results['leads_created']} leads",
-            "results": results
+            "status": "started",
+            "message": f"Scrape for {request.url} started in background."
         }
 
     except Exception as e:
-        logger.error(f"Error scraping company website: {e}")
+        logger.error(f"Error queuing company scrape: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.post("/discover-leads", summary="Discover new leads via search")
 async def discover_leads(
-    request: LeadDiscoveryRequest
+    request: LeadDiscoveryRequest,
+    background_tasks: BackgroundTasks
 ) -> Dict[str, Any]:
     """
     Discover new potential leads via search engines
 
-    This endpoint searches the web for companies matching your criteria,
-    then optionally scrapes each discovered company website.
+    Launches background task to search and optionally scrape companies.
 
     **Parameters:**
-    - **search_query**: Search query (e.g., "D2C ecommerce India hiring marketing")
-    - **num_results**: Number of search results to fetch (default: 20)
-    - **scrape_companies**: If true, also scrapes each discovered company website (slower)
+    - **search_query**: Search query
+    - **num_results**: Number of search results to fetch
+    - **scrape_companies**: If true, also scrapes each discovered company website
 
     **Returns:**
-    - List of discovered URLs and leads created
-
-    **Example:**
-    ```json
-    {
-        "search_query": "SaaS startup India hiring growth marketing",
-        "num_results": 30,
-        "scrape_companies": true
-    }
-    ```
+    - Status message
     """
     try:
-        logger.info(f"Starting lead discovery: {request.search_query}")
+        logger.info(f"Starting lead discovery background task: {request.search_query}")
 
-        results = scraping_service.discover_leads(
+        background_tasks.add_task(
+            scraping_service.discover_leads,
             search_query=request.search_query,
             num_results=request.num_results or 20,
             scrape_companies=request.scrape_companies or False
         )
 
         return {
-            "status": "completed",
-            "message": f"Found {results['urls_found']} URLs, created {results['leads_created']} leads",
-            "results": results
+            "status": "started",
+            "message": f"Lead discovery for '{request.search_query}' started in background."
         }
 
     except Exception as e:
-        logger.error(f"Error discovering leads: {e}")
+        logger.error(f"Error queuing lead discovery: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.post("/career-page", summary="Scrape a career/jobs page")
 async def scrape_career_page(
-    request: CareerPageScrapeRequest
+    request: CareerPageScrapeRequest,
+    background_tasks: BackgroundTasks
 ) -> Dict[str, Any]:
     """
     Scrape a specific career/jobs page for job postings
 
-    This endpoint is useful when you know a company's career page URL
-    and want to extract all job postings from it.
+    Launches background task.
 
     **Parameters:**
     - **url**: Career page URL
     - **company_name**: Company name
 
     **Returns:**
-    - Jobs found and leads created
-
-    **Example:**
-    ```json
-    {
-        "url": "https://example.com/careers",
-        "company_name": "Example Corp"
-    }
-    ```
+    - Status message
     """
     try:
-        logger.info(f"Starting career page scrape: {request.url}")
+        logger.info(f"Starting career page scrape background task: {request.url}")
 
-        results = scraping_service.scrape_career_page(
+        background_tasks.add_task(
+            scraping_service.scrape_career_page,
             url=str(request.url),
             company_name=request.company_name
         )
 
         return {
-            "status": "completed",
-            "message": f"Found {results['jobs_found']} jobs, created {results['leads_created']} leads",
-            "results": results
+            "status": "started",
+            "message": f"Career page scrape for {request.company_name} started in background."
         }
 
     except Exception as e:
-        logger.error(f"Error scraping career page: {e}")
+        logger.error(f"Error queuing career page scrape: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/startup-listings", summary="Scrape startup directories")
+async def scrape_startup_listings(
+    request: StartupScrapeRequest,
+    background_tasks: BackgroundTasks
+) -> Dict[str, Any]:
+    """
+    Scrape startup listings (e.g. YCombinator) for leads
+
+    Launches background task.
+
+    **Parameters:**
+    - **source**: Source name
+    - **query**: Search query
+
+    **Returns:**
+    - Status message
+    """
+    try:
+        logger.info(f"Starting startup listings scrape background task: {request.source}")
+
+        background_tasks.add_task(
+            scraping_service.scrape_startup_listings,
+            source=request.source,
+            query=request.query
+        )
+
+        return {
+            "status": "started",
+            "message": f"Startup listing scrape ({request.source}) started in background."
+        }
+
+    except Exception as e:
+        logger.error(f"Error queuing startup scrape: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/custom-urls", summary="Scrape custom URL list")
+async def scrape_custom_urls(
+    request: CustomUrlsRequest,
+    background_tasks: BackgroundTasks
+) -> Dict[str, Any]:
+    """
+    Scrape a provided list of URLs for leads
+
+    Launches background task.
+
+    **Parameters:**
+    - **urls**: List of URLs to scrape
+
+    **Returns:**
+    - Status message
+    """
+    try:
+        logger.info(f"Starting custom URLs scrape background task: {len(request.urls)} URLs")
+
+        background_tasks.add_task(
+            scraping_service.scrape_custom_urls,
+            urls=[str(u) for u in request.urls]
+        )
+
+        return {
+            "status": "started",
+            "message": f"Scrape for {len(request.urls)} custom URLs started in background."
+        }
+
+    except Exception as e:
+        logger.error(f"Error queuing custom URLs scrape: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -281,6 +325,22 @@ async def list_scraping_sources() -> Dict[str, Any]:
                 "Extract social media links",
                 "Identify technologies used",
                 "Estimate company size"
+            ]
+        },
+        "startup_listings": [
+            {
+                "name": "ycombinator",
+                "description": "Y Combinator Companies Directory",
+                "regions": ["Global"],
+                "rate_limit": "2 seconds between requests"
+            }
+        ],
+        "custom_sources": {
+            "description": "Scrape custom lists of URLs (forums, blogs, directories)",
+            "features": [
+                "Extract company info",
+                "Detect hiring signals",
+                "Create leads"
             ]
         }
     }

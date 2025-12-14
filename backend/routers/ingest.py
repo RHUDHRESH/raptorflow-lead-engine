@@ -2,7 +2,10 @@
 
 from fastapi import APIRouter, UploadFile, File, Depends, BackgroundTasks, HTTPException
 from sqlalchemy.orm import Session
-import pytesseract
+import os
+import shutil
+import subprocess
+import tempfile
 from PIL import Image
 import io
 import re
@@ -90,6 +93,38 @@ def normalize_phone_number(phone: str, default_region: str = "IN") -> Optional[s
     except NumberParseException:
         return None
 
+def ocr_image_with_tesseract(image: Image.Image, lang: str = "eng") -> str:
+    tesseract_cmd = shutil.which("tesseract")
+    if not tesseract_cmd:
+        raise RuntimeError("Tesseract binary not installed or not on PATH")
+
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
+            temp_path = tmp.name
+
+        # Ensure image is in a supported mode for PNG
+        if image.mode not in ("RGB", "RGBA", "L"):
+            image = image.convert("RGB")
+
+        image.save(temp_path, format="PNG")
+
+        result = subprocess.run(
+            [tesseract_cmd, temp_path, "stdout", "-l", lang],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise RuntimeError((result.stderr or "Tesseract OCR failed").strip())
+
+        return (result.stdout or "").strip()
+    finally:
+        if temp_path:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+
 def extract_phones(text: str) -> list:
     """Extract and normalize phone numbers from text using regex."""
     phone_patterns = [
@@ -158,7 +193,7 @@ async def ingest_ocr(
         if file.content_type.startswith("image"):
             # Image handling: use Tesseract OCR
             image = Image.open(io.BytesIO(contents))
-            extracted_text = pytesseract.image_to_string(image, lang='eng')
+            extracted_text = ocr_image_with_tesseract(image, lang='eng')
             logger.info(f"OCR'd image: {file.filename}")
 
         elif file.content_type == "application/pdf" or file.filename.endswith(".pdf"):
@@ -180,7 +215,7 @@ async def ingest_ocr(
                                     # Convert page to image and OCR
                                     img = page.to_image(resolution=300)
                                     pil_img = img.original
-                                    text = pytesseract.image_to_string(pil_img, lang='eng')
+                                    text = ocr_image_with_tesseract(pil_img, lang='eng')
                                     logger.info(f"OCR'd PDF page {page_num + 1} of {file.filename}")
                                 except Exception as ocr_err:
                                     logger.warning(f"OCR failed for page {page_num + 1}: {ocr_err}")
@@ -263,7 +298,7 @@ async def ingest_ocr_and_classify(
         if file.content_type.startswith("image"):
             # Image: OCR with Tesseract
             image = Image.open(io.BytesIO(contents))
-            extracted_text = pytesseract.image_to_string(image, lang='eng')
+            extracted_text = ocr_image_with_tesseract(image, lang='eng')
             source_type = "ocr_image"
         elif file.content_type == "application/pdf" or file.filename.endswith(".pdf"):
             # PDF: text extraction
@@ -324,6 +359,14 @@ async def ingest_csv(
         contents = await file.read()
         stream = stdio.StringIO(contents.decode("utf8"))
         csv_reader = csv.DictReader(stream)
+
+        # Validate headers
+        if not csv_reader.fieldnames or "signal_text" not in csv_reader.fieldnames:
+            raise HTTPException(
+                status_code=400,
+                detail=f"CSV must have 'signal_text' column. Found columns: {csv_reader.fieldnames}. "
+                        "Required: signal_text, company_name (optional), company_website (optional)"
+            )
 
         results = []
         processed_count = 0

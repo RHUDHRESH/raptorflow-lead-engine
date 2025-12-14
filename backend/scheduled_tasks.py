@@ -1,10 +1,4 @@
-"""Scheduled tasks for periodic job board scraping and data ingestion.
-
-This module uses APScheduler to run periodic tasks such as:
-- Daily job board API polling
-- RSS feed monitoring
-- Re-scraping company websites
-"""
+"""Scheduled tasks for periodic scraping."""
 
 import logging
 from datetime import datetime
@@ -12,203 +6,96 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from sqlalchemy.orm import Session
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
-from job_board_apis import JobBoardAPIClient, job_to_signal_text
-from routers.classify import SignalInput, classify_signal as classify_signal_func
-from database import SessionLocal
+from database import SessionLocal, ScrapeSchedule
+from scrapers.scraping_service import scraping_service
 
 logger = logging.getLogger(__name__)
 
 # Global scheduler instance
 scheduler = AsyncIOScheduler()
 
-
-# ============================================================================
-# Task Functions
-# ============================================================================
-
-async def scheduled_job_board_poll():
+async def execute_scrape_job(schedule_id: int):
     """
-    Scheduled task to poll job boards for new marketing roles.
-    Runs daily at 9 AM.
+    Execute a single scheduled scrape job.
     """
-    logger.info("Starting scheduled job board poll...")
-
+    logger.info(f"Executing scheduled job {schedule_id}")
     db = SessionLocal()
     try:
-        # Initialize job board API client
-        client = JobBoardAPIClient()
+        schedule = db.query(ScrapeSchedule).filter(ScrapeSchedule.id == schedule_id).first()
+        if not schedule or not schedule.is_active:
+            logger.warning(f"Schedule {schedule_id} not found or inactive")
+            return
 
-        # Fetch jobs from all configured boards
-        jobs = await client.fetch_all_marketing_jobs(
-            boards=["naukri", "linkedin"],
-            keywords=["marketing manager", "growth hacker", "digital marketing", "marketing head"],
-            location="India",
-            max_results_per_board=25
-        )
-
-        logger.info(f"Fetched {len(jobs)} jobs from job boards")
-
-        # Classify each job
-        created_leads = []
-        for job in jobs:
-            try:
-                # Convert job to signal text
-                signal_text = job_to_signal_text(job)
-
-                # Create signal input
-                signal = SignalInput(
-                    signal_text=signal_text,
-                    source_type="job_post",
-                    company_name=job.company_name,
-                    source_url=job.url,
-                )
-
-                # Classify (no background tasks in scheduled context)
-                result = await classify_signal_func(signal, background_tasks=None, db=db)
-
-                if result.total_score >= 40:  # Only track if at least "nurture" quality
-                    created_leads.append({
-                        "company": job.company_name,
-                        "title": job.title,
-                        "score": result.total_score,
-                        "bucket": result.score_bucket,
-                    })
-
-            except Exception as e:
-                logger.error(f"Error classifying job from {job.company_name}: {e}")
-
-        logger.info(f"Scheduled job poll complete. Created {len(created_leads)} leads.")
-
-        # Optionally: Send summary email/notification here
-        return {
-            "total_jobs_fetched": len(jobs),
-            "leads_created": len(created_leads),
-            "timestamp": datetime.now().isoformat(),
-        }
+        # Execute based on type (Runs in thread pool via scraping_service)
+        # Note: scraping_service methods are sync, but execute_scrape_job is async.
+        # APScheduler runs async jobs in event loop. Blocking calls here will block loop.
+        # scraping_service uses ThreadPoolExecutor internally? No, it uses it for concurrent sub-tasks.
+        # But the methods themselves are synchronous wrapper calls.
+        # We should run them in a thread executor to be safe.
+        
+        import asyncio
+        loop = asyncio.get_running_loop()
+        
+        params = schedule.job_params or {}
+        
+        if schedule.job_type == "job_boards":
+            await loop.run_in_executor(None, lambda: scraping_service.scrape_job_boards(**params))
+        elif schedule.job_type == "startup_listings":
+            await loop.run_in_executor(None, lambda: scraping_service.scrape_startup_listings(**params))
+        elif schedule.job_type == "custom_urls":
+            await loop.run_in_executor(None, lambda: scraping_service.scrape_custom_urls(**params))
+        
+        # Update stats
+        schedule.last_run_at = datetime.utcnow()
+        db.commit()
+        logger.info(f"Job {schedule_id} ({schedule.name}) completed")
 
     except Exception as e:
-        logger.error(f"Error in scheduled job board poll: {e}")
-        return {"error": str(e)}
-
+        logger.error(f"Error in scheduled job {schedule_id}: {e}")
     finally:
         db.close()
 
-
-async def scheduled_rss_feed_monitor():
-    """
-    Scheduled task to monitor configured RSS feeds.
-    Runs every 6 hours.
-    """
-    logger.info("Starting scheduled RSS feed monitor...")
-
-    # TODO: Store RSS feed URLs in database or config
-    # For now, this is a placeholder
-
-    rss_feeds = [
-        # Add your RSS feed URLs here
-        # "https://example.com/jobs/feed.xml",
-    ]
-
-    if not rss_feeds:
-        logger.info("No RSS feeds configured for monitoring")
-        return {"message": "No feeds configured"}
-
-    try:
-        import feedparser
-
-        db = SessionLocal()
-        total_items_processed = 0
-
-        for feed_url in rss_feeds:
-            try:
-                feed = feedparser.parse(feed_url)
-
-                for entry in feed.entries[:10]:  # Process max 10 items per feed
-                    title = entry.get("title", "")
-                    description = entry.get("description", "") or entry.get("summary", "")
-                    link = entry.get("link", "")
-
-                    if not description:
-                        continue
-
-                    # Build signal text
-                    signal_text = f"Title: {title}\n\nDescription: {description}"
-
-                    # Classify
-                    signal = SignalInput(
-                        signal_text=signal_text,
-                        source_type="rss_feed",
-                        source_url=link,
-                    )
-
-                    result = await classify_signal_func(signal, background_tasks=None, db=db)
-
-                    if result.total_score >= 40:
-                        total_items_processed += 1
-
-            except Exception as e:
-                logger.error(f"Error processing RSS feed {feed_url}: {e}")
-
-        logger.info(f"RSS feed monitor complete. Processed {total_items_processed} items.")
-
-        db.close()
-        return {
-            "feeds_monitored": len(rss_feeds),
-            "items_processed": total_items_processed,
-            "timestamp": datetime.now().isoformat(),
-        }
-
-    except ImportError:
-        logger.error("feedparser not installed. Cannot monitor RSS feeds.")
-        return {"error": "feedparser not installed"}
-
-    except Exception as e:
-        logger.error(f"Error in scheduled RSS feed monitor: {e}")
-        return {"error": str(e)}
-
-
-# ============================================================================
-# Scheduler Configuration
-# ============================================================================
-
 def configure_scheduler():
     """
-    Configure and add all scheduled tasks to the scheduler.
+    Load schedules from DB and configure scheduler.
     """
-    # Job board poll - Daily at 9:00 AM
-    scheduler.add_job(
-        scheduled_job_board_poll,
-        trigger=CronTrigger(hour=9, minute=0),
-        id="job_board_poll",
-        name="Daily Job Board Poll",
-        replace_existing=True,
-    )
-    logger.info("Scheduled: Daily Job Board Poll at 9:00 AM")
-
-    # RSS feed monitor - Every 6 hours
-    scheduler.add_job(
-        scheduled_rss_feed_monitor,
-        trigger=IntervalTrigger(hours=6),
-        id="rss_feed_monitor",
-        name="RSS Feed Monitor",
-        replace_existing=True,
-    )
-    logger.info("Scheduled: RSS Feed Monitor every 6 hours")
-
-    # Add more scheduled tasks here as needed
-    # Examples:
-    # - Company website re-scraping (weekly)
-    # - Lead score recalculation (daily)
-    # - Data cleanup (weekly)
-
+    db = SessionLocal()
+    try:
+        schedules = db.query(ScrapeSchedule).filter(ScrapeSchedule.is_active == True).all()
+        
+        # Clear existing jobs to avoid duplicates on reload
+        scheduler.remove_all_jobs()
+        
+        for sched in schedules:
+            trigger = None
+            try:
+                if sched.schedule_type == "cron" and sched.cron_expression:
+                    trigger = CronTrigger.from_crontab(sched.cron_expression)
+                elif sched.schedule_type == "interval" and sched.interval_minutes:
+                    trigger = IntervalTrigger(minutes=sched.interval_minutes)
+                
+                if trigger:
+                    scheduler.add_job(
+                        execute_scrape_job,
+                        trigger=trigger,
+                        args=[sched.id],
+                        id=str(sched.id),
+                        name=sched.name,
+                        replace_existing=True
+                    )
+                    logger.info(f"Loaded schedule: {sched.name} ({sched.schedule_type})")
+            except Exception as e:
+                logger.error(f"Error loading schedule {sched.name}: {e}")
+                
+    except Exception as e:
+        logger.error(f"Error configuring scheduler: {e}")
+    finally:
+        db.close()
 
 def start_scheduler():
-    """
-    Start the scheduler.
-    Call this from main.py on application startup.
-    """
+    """Start the scheduler."""
     if not scheduler.running:
         configure_scheduler()
         scheduler.start()
@@ -216,47 +103,53 @@ def start_scheduler():
     else:
         logger.warning("Scheduler is already running")
 
-
 def stop_scheduler():
-    """
-    Stop the scheduler.
-    Call this on application shutdown.
-    """
+    """Stop the scheduler."""
     if scheduler.running:
         scheduler.shutdown()
         logger.info("Scheduler stopped")
 
+def refresh_scheduler():
+    """Reload schedules from DB."""
+    logger.info("Refreshing scheduler...")
+    configure_scheduler()
 
-def get_scheduled_jobs():
-    """
-    Get list of all scheduled jobs with their next run times.
 
-    Returns:
-        List of job information dictionaries
-    """
+def get_scheduled_jobs() -> List[Dict[str, Any]]:
+    """Return a serializable list of currently scheduled jobs."""
     jobs = []
-    for job in scheduler.get_jobs():
-        jobs.append({
-            "id": job.id,
-            "name": job.name,
-            "next_run_time": job.next_run_time.isoformat() if job.next_run_time else None,
-            "trigger": str(job.trigger),
-        })
+    try:
+        for job in scheduler.get_jobs():
+            next_run_time: Optional[str] = None
+            if job.next_run_time:
+                try:
+                    next_run_time = job.next_run_time.isoformat()
+                except Exception:
+                    next_run_time = str(job.next_run_time)
+
+            jobs.append(
+                {
+                    "id": job.id,
+                    "name": job.name,
+                    "next_run_time": next_run_time,
+                    "trigger": str(job.trigger),
+                }
+            )
+    except Exception as e:
+        logger.error(f"Error retrieving scheduled jobs: {e}")
+
     return jobs
 
 
-def trigger_job_now(job_id: str):
-    """
-    Manually trigger a scheduled job to run immediately.
-
-    Args:
-        job_id: The ID of the job to trigger
-    """
+def trigger_job_now(job_id: str) -> bool:
+    """Force a scheduled job to run as soon as possible."""
     job = scheduler.get_job(job_id)
-    if job:
-        job.modify(next_run_time=datetime.now())
-        logger.info(f"Manually triggered job: {job_id}")
+    if not job:
+        return False
+
+    try:
+        scheduler.modify_job(job_id, next_run_time=datetime.utcnow())
         return True
-    else:
-        logger.error(f"Job not found: {job_id}")
+    except Exception as e:
+        logger.error(f"Error triggering job {job_id}: {e}")
         return False

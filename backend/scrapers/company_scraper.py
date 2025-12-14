@@ -5,10 +5,47 @@ import logging
 from typing import List, Dict, Any, Optional, Set
 from urllib.parse import urljoin, urlparse
 import re
+import io
+import os
+import shutil
+import subprocess
+import tempfile
+from PIL import Image
 
 from .base_scraper import BaseScraper
 
 logger = logging.getLogger(__name__)
+
+def _ocr_image_with_tesseract(image: Image.Image, lang: str = "eng") -> str:
+    tesseract_cmd = shutil.which("tesseract")
+    if not tesseract_cmd:
+        return ""
+
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
+            temp_path = tmp.name
+
+        if image.mode not in ("RGB", "RGBA", "L"):
+            image = image.convert("RGB")
+
+        image.save(temp_path, format="PNG")
+
+        result = subprocess.run(
+            [tesseract_cmd, temp_path, "stdout", "-l", lang],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            return ""
+
+        return (result.stdout or "").strip()
+    finally:
+        if temp_path:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
 
 
 class CompanyScraper(BaseScraper):
@@ -42,6 +79,7 @@ class CompanyScraper(BaseScraper):
             'description': None,
             'emails': [],
             'phones': [],
+            'people': [],
             'social_links': {},
             'career_page_url': None,
             'contact_page_url': None,
@@ -58,7 +96,18 @@ class CompanyScraper(BaseScraper):
                 logger.warning(f"Could not fetch {url}")
                 return company_data
 
-            soup = self.parse_html(response.text)
+            response_text = response.text or ""
+            lowered = response_text.lower()
+            if (
+                "checking your browser" in lowered
+                or "cf-browser-verification" in lowered
+                or "cf-challenge" in lowered
+                or "cloudflare" in lowered and "attention required" in lowered
+            ):
+                logger.warning(f"Bot protection detected for {url}; skipping content extraction")
+                return company_data
+
+            soup = self.parse_html(response_text)
 
             # Extract basic company info
             basic_info = self.extract_company_info(soup, url)
@@ -72,6 +121,8 @@ class CompanyScraper(BaseScraper):
             company_data['career_page_url'] = links.get('career')
             company_data['contact_page_url'] = links.get('contact')
 
+            company_data['people'].extend(self._extract_people_from_soup(soup, url))
+
             # Check for hiring signals on homepage
             company_data['job_signals'] = self._find_hiring_signals(soup)
             company_data['has_jobs'] = len(company_data['job_signals']) > 0
@@ -81,6 +132,22 @@ class CompanyScraper(BaseScraper):
 
             # Extract company size hints
             company_data['company_size_hints'] = self._extract_size_hints(soup)
+
+            # Extract preview image (og:image) for Agent Preview
+            company_data['preview_image'] = self._extract_preview_image(soup, url)
+
+            # Run OCR on suspicious images (Agent OCR)
+            ocr_text = self._scan_images_for_ocr(soup, url)
+            if ocr_text:
+                # Extract info from OCR text
+                ocr_emails = self.extract_emails(ocr_text)
+                ocr_phones = self.extract_phones(ocr_text)
+                if ocr_emails:
+                    company_data['emails'].extend(ocr_emails)
+                    logger.info(f"OCR found emails: {ocr_emails}")
+                if ocr_phones:
+                    company_data['phones'].extend(ocr_phones)
+                    logger.info(f"OCR found phones: {ocr_phones}")
 
             # If deep scan, visit career and contact pages
             if deep_scan:
@@ -95,10 +162,32 @@ class CompanyScraper(BaseScraper):
                     contact_data = self._scrape_contact_page(company_data['contact_page_url'])
                     company_data['emails'].extend(contact_data.get('emails', []))
                     company_data['phones'].extend(contact_data.get('phones', []))
+                    company_data['people'].extend(contact_data.get('people', []))
+
+                for people_page in self._extract_people_page_urls(soup, url):
+                    if people_page in {company_data.get('career_page_url'), company_data.get('contact_page_url')}:
+                        continue
+                    contact_data = self._scrape_contact_page(people_page)
+                    company_data['emails'].extend(contact_data.get('emails', []))
+                    company_data['phones'].extend(contact_data.get('phones', []))
+                    company_data['people'].extend(contact_data.get('people', []))
 
             # Deduplicate lists
             company_data['emails'] = list(set(company_data['emails']))
             company_data['phones'] = list(set(company_data['phones']))
+            dedup_people = []
+            seen_people = set()
+            for person in company_data.get('people') or []:
+                key = (
+                    (person.get('email') or '').strip().lower(),
+                    (person.get('phone') or '').strip(),
+                    (person.get('name') or '').strip().lower(),
+                )
+                if key in seen_people:
+                    continue
+                seen_people.add(key)
+                dedup_people.append(person)
+            company_data['people'] = dedup_people
             company_data['job_signals'] = list(set(company_data['job_signals']))
             company_data['technologies'] = list(set(company_data['technologies']))
 
@@ -164,6 +253,119 @@ class CompanyScraper(BaseScraper):
                 break
 
         return links
+
+    def _extract_people_page_urls(self, soup, base_url: str) -> List[str]:
+        urls: List[str] = []
+        for link in soup.find_all('a', href=True):
+            href = (link.get('href') or '').strip()
+            if not href:
+                continue
+            href_l = href.lower()
+            text_l = (link.get_text() or '').strip().lower()
+            if any(k in href_l or k in text_l for k in ('contact', 'team', 'about', 'leadership', 'founder', 'management')):
+                full_url = urljoin(base_url, href)
+                urls.append(full_url)
+        deduped = []
+        seen = set()
+        for u in urls:
+            if u in seen:
+                continue
+            seen.add(u)
+            deduped.append(u)
+        return deduped[:3]
+
+    def _extract_people_from_soup(self, soup, source_url: str) -> List[Dict[str, Any]]:
+        people: List[Dict[str, Any]] = []
+        blocks = soup.find_all(['section', 'div', 'li', 'article', 'p'])
+
+        name_re = re.compile(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3}\b")
+        role_re = re.compile(
+            r"\b(Founder|Co-?Founder|CEO|CTO|CMO|COO|CFO|VP|Vice President|Director|Head|Manager|Marketing|Growth|Sales)\b",
+            re.IGNORECASE,
+        )
+
+        for block in blocks:
+            text = (block.get_text(" ", strip=True) or "").strip()
+            if not text:
+                continue
+            emails = self.extract_emails(text)
+            phones = self.extract_phones(text)
+            if not emails or not phones:
+                continue
+
+            name = None
+            for tag in block.find_all(['h1', 'h2', 'h3', 'strong', 'b', 'span']):
+                cand = (tag.get_text(" ", strip=True) or "").strip()
+                if not cand:
+                    continue
+                if len(cand) > 80:
+                    continue
+                if '@' in cand:
+                    continue
+                if any(word in cand.lower() for word in ('contact', 'email', 'phone', 'call', 'write to', 'reach')):
+                    continue
+                m = name_re.search(cand)
+                if m:
+                    name = m.group(0).strip()
+                    break
+
+            if not name:
+                m = name_re.search(text)
+                if m:
+                    name = m.group(0).strip()
+
+            role = None
+            m_role = role_re.search(text)
+            if m_role:
+                role = m_role.group(0).strip()
+
+            email = (emails[0] or '').strip()
+            phone = (phones[0] or '').strip()
+            if not (name and email and phone):
+                continue
+
+            people.append({
+                'name': name,
+                'role': role,
+                'email': email,
+                'phone': phone,
+                'source_url': source_url,
+            })
+
+        if people:
+            return people
+
+        # Fallback (still compliant): if the page has explicit email + phone anywhere,
+        # pair them with the best page-level name candidate (or "Contact Team").
+        page_text = (soup.get_text(" ", strip=True) or "").strip()
+        page_emails = self.extract_emails(page_text)
+        page_phones = self.extract_phones(page_text)
+        if page_emails and page_phones:
+            candidate_name = None
+            for tag in soup.find_all(['h1', 'h2', 'h3', 'strong']):
+                cand = (tag.get_text(" ", strip=True) or "").strip()
+                if not cand or len(cand) > 80:
+                    continue
+                if any(word in cand.lower() for word in ('contact', 'reach', 'connect', 'support', 'sales', 'team')):
+                    candidate_name = cand
+                    break
+                m = name_re.search(cand)
+                if m:
+                    candidate_name = m.group(0).strip()
+                    break
+
+            if not candidate_name:
+                candidate_name = "Contact Team"
+
+            people.append({
+                'name': candidate_name,
+                'role': None,
+                'email': (page_emails[0] or '').strip(),
+                'phone': (page_phones[0] or '').strip(),
+                'source_url': source_url,
+            })
+
+        return people
 
     def _find_hiring_signals(self, soup) -> List[str]:
         """Find hiring/job-related signals on page"""
@@ -261,6 +463,60 @@ class CompanyScraper(BaseScraper):
 
         return hints[:5]
 
+    def _extract_preview_image(self, soup, url: str) -> Optional[str]:
+        """Extract og:image or first large image as preview"""
+        og_image = soup.find('meta', property='og:image')
+        if og_image and og_image.get('content'):
+            return urljoin(url, og_image['content'])
+        
+        # Fallback: Find a logo or large image
+        # Heuristic: Image with 'logo' in class or id
+        logo = soup.find('img', class_=re.compile(r'logo', re.I))
+        if logo and logo.get('src'):
+            return urljoin(url, logo['src'])
+            
+        return None
+
+    def _scan_images_for_ocr(self, soup, base_url: str) -> str:
+        """Scan images that might contain text (contact info) and run OCR"""
+        ocr_results = []
+        
+        # Find images that look like they might have contact info
+        # e.g. filename contains 'email', 'contact', 'phone'
+        images = soup.find_all('img', src=True)
+        target_images = []
+        
+        for img in images:
+            src = img['src'].lower()
+            if any(k in src for k in ['email', 'contact', 'phone', 'mail', 'call']):
+                full_url = urljoin(base_url, img['src'])
+                target_images.append(full_url)
+                
+        # Also check for images in contact sections
+        contact_section = soup.find('div', class_=re.compile(r'contact|footer', re.I))
+        if contact_section:
+            for img in contact_section.find_all('img', src=True):
+                full_url = urljoin(base_url, img['src'])
+                if full_url not in target_images:
+                    target_images.append(full_url)
+
+        # Limit OCR to avoid slowness
+        for img_url in target_images[:3]:
+            try:
+                # Download image
+                response = self.fetch(img_url)
+                if response:
+                    image = Image.open(io.BytesIO(response.content))
+                    # Run OCR
+                    text = _ocr_image_with_tesseract(image)
+                    if len(text.strip()) > 5:
+                        ocr_results.append(text)
+                        logger.info(f"OCR extracted text from {img_url}")
+            except Exception as e:
+                logger.warning(f"OCR failed for {img_url}: {e}")
+                
+        return "\n".join(ocr_results)
+
     def _scrape_career_page(self, url: str) -> Dict[str, Any]:
         """Scrape career/jobs page for detailed information"""
         data = {
@@ -304,7 +560,8 @@ class CompanyScraper(BaseScraper):
         """Scrape contact/about page for contact information"""
         data = {
             'emails': [],
-            'phones': []
+            'phones': [],
+            'people': [],
         }
 
         try:
@@ -317,6 +574,7 @@ class CompanyScraper(BaseScraper):
 
             data['emails'] = self.extract_emails(page_text)
             data['phones'] = self.extract_phones(page_text)
+            data['people'] = self._extract_people_from_soup(soup, url)
 
         except Exception as e:
             logger.error(f"Error scraping contact page {url}: {e}")
@@ -328,6 +586,125 @@ class LeadDiscoveryScraper(BaseScraper):
     """
     Scraper for discovering new leads via search engines
     """
+
+    def _extract_duckduckgo_results_from_soup(
+        self,
+        soup: BeautifulSoup,
+        num_results: int,
+        source: str,
+    ) -> List[Dict[str, Any]]:
+        results: List[Dict[str, Any]] = []
+
+        # DuckDuckGo endpoints have multiple HTML variants.
+        # Prefer known containers but fall back to broader selectors.
+        candidates: List[Any] = []
+        candidates.extend(soup.find_all('div', class_='result'))
+        candidates.extend(soup.find_all('div', class_='results_links'))
+        candidates.extend(soup.find_all('tr'))
+
+        def _push_result(title_link, snippet_text: str | None):
+            if not title_link:
+                return
+            title = self.clean_text(title_link.get_text() or "")
+            raw_href = title_link.get('href')
+            url = self._normalize_duckduckgo_result_url(raw_href)
+            if not (title and url):
+                return
+            results.append(
+                {
+                    'title': title,
+                    'url': url,
+                    'snippet': self.clean_text(snippet_text) if snippet_text else None,
+                    'source': source,
+                }
+            )
+
+        # Variant A: html.duckduckgo.com
+        for div in soup.find_all('div', class_='result'):
+            if len(results) >= num_results:
+                break
+            title_link = div.find('a', class_='result__a') or div.find('a', class_='result__url')
+            snippet_elem = (
+                div.find('a', class_='result__snippet')
+                or div.find('div', class_='result__snippet')
+                or div.find('span', class_='result__snippet')
+            )
+            _push_result(title_link, snippet_elem.get_text() if snippet_elem else None)
+
+        if len(results) >= num_results:
+            return results[:num_results]
+
+        # Variant B: lite.duckduckgo.com
+        for a in soup.select('a.result-link'):
+            if len(results) >= num_results:
+                break
+            snippet_text = None
+            tr = a.find_parent('tr')
+            if tr:
+                snippet_cell = tr.find('td', class_='result-snippet')
+                if snippet_cell:
+                    snippet_text = snippet_cell.get_text()
+            _push_result(a, snippet_text)
+
+        if len(results) >= num_results:
+            return results[:num_results]
+
+        # Variant C: last-resort generic anchors (avoid DDG internal nav)
+        for a in soup.find_all('a'):
+            if len(results) >= num_results:
+                break
+            href = (a.get('href') or '').strip()
+            if not href:
+                continue
+            if 'duckduckgo.com' in href and '/l/' not in href:
+                continue
+            title = self.clean_text(a.get_text() or "")
+            if not title or len(title) < 3:
+                continue
+            _push_result(a, None)
+
+        return results[:num_results]
+
+    def _normalize_duckduckgo_result_url(self, href: str) -> str | None:
+        if not href:
+            return None
+
+        href = href.strip()
+        if not href:
+            return None
+
+        try:
+            from urllib.parse import urlparse, parse_qs, unquote, urljoin
+
+            # DuckDuckGo sometimes returns protocol-relative URLs
+            if href.startswith("//"):
+                href = f"https:{href}"
+
+            # DuckDuckGo HTML sometimes returns relative redirect links
+            if href.startswith("/"):
+                href = urljoin("https://duckduckgo.com", href)
+
+            parsed = urlparse(href)
+
+            # Decode redirect target if present
+            if parsed.netloc.endswith("duckduckgo.com") and parsed.path.startswith("/l/"):
+                qs = parse_qs(parsed.query)
+                uddg = qs.get("uddg", [None])[0]
+                if uddg:
+                    target = unquote(uddg)
+                    if target.startswith("//"):
+                        target = f"https:{target}"
+                    if target.startswith("http://") or target.startswith("https://"):
+                        return target
+
+            # Otherwise ensure it is an absolute URL
+            if href.startswith("http://") or href.startswith("https://"):
+                return href
+
+        except Exception:
+            return None
+
+        return None
 
     def search_for_leads(self, query: str, num_results: int = 20) -> List[Dict[str, Any]]:
         """
@@ -364,35 +741,23 @@ class LeadDiscoveryScraper(BaseScraper):
 
             soup = self.parse_html(response.text)
 
-            # DuckDuckGo HTML results
-            result_divs = soup.find_all('div', class_='result')
+            results = self._extract_duckduckgo_results_from_soup(
+                soup=soup,
+                num_results=num_results,
+                source='duckduckgo_html',
+            )
 
-            for div in result_divs[:num_results]:
-                try:
-                    result = {
-                        'title': None,
-                        'url': None,
-                        'snippet': None,
-                        'source': 'duckduckgo'
-                    }
-
-                    # Title and URL
-                    title_link = div.find('a', class_='result__a')
-                    if title_link:
-                        result['title'] = self.clean_text(title_link.get_text())
-                        result['url'] = title_link.get('href')
-
-                    # Snippet
-                    snippet_elem = div.find('a', class_='result__snippet')
-                    if snippet_elem:
-                        result['snippet'] = self.clean_text(snippet_elem.get_text())
-
-                    if result['title'] and result['url']:
-                        results.append(result)
-
-                except Exception as e:
-                    logger.error(f"Error parsing search result: {e}")
-                    continue
+            # Fallback: DuckDuckGo lite endpoint (often more stable than html).
+            if not results:
+                lite_url = f"https://lite.duckduckgo.com/lite/?q={quote_plus(query)}"
+                lite_resp = self.fetch(lite_url)
+                if lite_resp:
+                    lite_soup = self.parse_html(lite_resp.text)
+                    results = self._extract_duckduckgo_results_from_soup(
+                        soup=lite_soup,
+                        num_results=num_results,
+                        source='duckduckgo_lite',
+                    )
 
         except Exception as e:
             logger.error(f"Error searching DuckDuckGo: {e}")

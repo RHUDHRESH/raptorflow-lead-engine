@@ -45,3 +45,12 @@ venv/
 env/
 ENV/
 
+# Local artifacts
+OllamaSetup.exe
+*.db
+backend/*.db
+.claude/settings.local.json
+
+# Generated exports
+backend/assets/exports/*.pdf
+

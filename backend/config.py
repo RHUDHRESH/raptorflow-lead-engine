@@ -19,6 +19,7 @@ class Settings(BaseSettings):
     ollama_model_1b: str = os.getenv("OLLAMA_MODEL_1B", "gemma3:1b")
     ollama_model_4b: str = os.getenv("OLLAMA_MODEL_4B", "gemma3:4b")
     ollama_embedding_model: str = os.getenv("OLLAMA_EMBEDDING_MODEL", "nomic-embed-text")
+    ollama_vision_model: str = os.getenv("OLLAMA_VISION_MODEL", "llava")
 
     # Alternative Model Support (Mistral, Llama, etc.)
     enable_alternative_models: bool = os.getenv("ENABLE_ALTERNATIVE_MODELS", "false").lower() == "true"
@@ -72,6 +73,14 @@ class Settings(BaseSettings):
     # Prompt Templates
     prompt_template_path: str = os.getenv("PROMPT_TEMPLATE_PATH", "./prompts")
     enable_custom_prompts: bool = os.getenv("ENABLE_CUSTOM_PROMPTS", "false").lower() == "true"
+
+    # GPU Acceleration
+    enable_gpu_acceleration: bool = os.getenv("ENABLE_GPU_ACCELERATION", "false").lower() == "true"
+    gpu_backend: str = os.getenv("GPU_BACKEND", "auto")  # "cuda", "vulkan", "metal", "auto"
+    gpu_device_id: int = int(os.getenv("GPU_DEVICE_ID", "0"))
+    gpu_memory_limit: str = os.getenv("GPU_MEMORY_LIMIT", "")  # e.g., "4GB"
+    gpu_threads: int = int(os.getenv("GPU_THREADS", "4"))
+    gpu_batch_size: int = int(os.getenv("GPU_BATCH_SIZE", "1"))
 
     class Config:
         env_file = ".env"

@@ -1,185 +1,152 @@
-"""Enhanced Ollama wrapper with caching, streaming, embeddings, and health monitoring."""
+"""Ollama wrapper for 1B and 4B models."""
 
 import json
 import asyncio
 import httpx
 import logging
-from typing import Optional, Dict, Any, AsyncIterator
-from datetime import datetime, timedelta
+from typing import Optional, Dict, Any, AsyncGenerator
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from config import Settings
 from cache_manager import get_cache_manager
-from prompt_templates import get_prompt_manager
 
 logger = logging.getLogger(__name__)
 
-
-class ModelHealthMonitor:
-    """Monitors Ollama model health and availability."""
-
-    def __init__(self, base_url: str, check_interval: int = 300, timeout: int = 10):
-        self.base_url = base_url
-        self.check_interval = check_interval
-        self.timeout = timeout
-        self.last_check: Optional[datetime] = None
-        self.is_healthy = False
-        self.last_latency_ms: Optional[float] = None
-        self.error_count = 0
-        self.success_count = 0
-
-    async def check_health(self, client: httpx.AsyncClient) -> bool:
-        """
-        Check if Ollama is healthy and responsive.
-
-        Returns:
-            True if healthy, False otherwise
-        """
-        try:
-            start_time = datetime.now()
-            response = await client.get(
-                f"{self.base_url}/api/tags",
-                timeout=self.timeout
-            )
-            response.raise_for_status()
-
-            # Calculate latency
-            latency = (datetime.now() - start_time).total_seconds() * 1000
-            self.last_latency_ms = latency
-            self.last_check = datetime.now()
-            self.is_healthy = True
-            self.success_count += 1
-
-            logger.debug(f"Ollama health check passed (latency: {latency:.2f}ms)")
-            return True
-
-        except Exception as e:
-            self.is_healthy = False
-            self.error_count += 1
-            self.last_check = datetime.now()
-            logger.error(f"Ollama health check failed: {e}")
-            return False
-
-    def should_check(self) -> bool:
-        """Determine if health check is due."""
-        if self.last_check is None:
-            return True
-        return datetime.now() - self.last_check > timedelta(seconds=self.check_interval)
-
-    def get_stats(self) -> Dict[str, Any]:
-        """Get health monitoring statistics."""
-        total_checks = self.success_count + self.error_count
-        success_rate = (self.success_count / total_checks * 100) if total_checks > 0 else 0
-
-        return {
-            "is_healthy": self.is_healthy,
-            "last_check": self.last_check.isoformat() if self.last_check else None,
-            "last_latency_ms": self.last_latency_ms,
-            "success_count": self.success_count,
-            "error_count": self.error_count,
-            "success_rate_percent": round(success_rate, 2),
-            "total_checks": total_checks
-        }
-
-
 class OllamaManager:
-    """
-    Enhanced Ollama manager with caching, streaming, embeddings, and health monitoring.
-
-    Features:
-    - Response caching (LRU memory or Redis)
-    - Streaming API support for real-time results
-    - Dynamic context window adjustment
-    - Health monitoring and metrics
-    - Embeddings for ICP matching
-    - Multi-stage classification
-    - Quantized model support
-    - Alternative model fallback
-    """
+    """Manages Ollama model interactions (1B for routing, 4B for dossiers)."""
 
     def __init__(self):
         self.settings = Settings()
         self.base_url = self.settings.ollama_base_url
+        
+        # Select models based on quantization setting
+        if self.settings.use_quantized_models:
+            self.model_1b = self.settings.quantized_model_1b
+            self.model_4b = self.settings.quantized_model_4b
+            logger.info(f"Using quantized models: {self.model_1b}, {self.model_4b}")
+        else:
+            self.model_1b = self.settings.ollama_model_1b
+            self.model_4b = self.settings.ollama_model_4b
+            
+        # Timeout: connection=10s, read=300s (for long model generation)
+        self.client = httpx.AsyncClient(timeout=httpx.Timeout(10.0, read=300.0))
+        self.cache_manager = get_cache_manager()
 
-        # Model selection (supports quantization and alternatives)
-        self.model_1b = self._select_model_1b()
-        self.model_4b = self._select_model_4b()
-        self.embedding_model = self.settings.ollama_embedding_model
-
-        self.client = httpx.AsyncClient(timeout=300)
-
-        # Health monitoring
-        if self.settings.enable_health_monitoring:
-            self.health_monitor = ModelHealthMonitor(
-                base_url=self.base_url,
-                check_interval=self.settings.health_check_interval_seconds,
-                timeout=self.settings.health_check_timeout_seconds
+    async def warm_up_models(self):
+        """Warm up models in background to eliminate cold-start latency."""
+        if not self.settings.enable_health_monitoring:
+            return
+            
+        try:
+            # Warm up 1B model with a simple prompt
+            warmup_prompt = "Warm up: hello"
+            await self.client.post(
+                f"{self.base_url}/api/generate",
+                json={
+                    "model": self.model_1b,
+                    "prompt": warmup_prompt,
+                    "stream": False,
+                    "options": {
+                        "temperature": 0.1,
+                        "max_tokens": 5,
+                        **self._get_gpu_options()
+                    }
+                },
+                timeout=10.0
             )
-        else:
-            self.health_monitor = None
+            logger.info("✅ 1B model warmed up")
+            
+            # Warm up 4B model if it's likely to be used
+            if self.settings.classifier_score_threshold > 0:
+                await self.client.post(
+                    f"{self.base_url}/api/generate",
+                    json={
+                        "model": self.model_4b,
+                        "prompt": warmup_prompt,
+                        "stream": False,
+                        "options": {
+                            "temperature": 0.1,
+                            "max_tokens": 5,
+                            **self._get_gpu_options()
+                        }
+                    },
+                    timeout=15.0
+                )
+                logger.info("✅ 4B model warmed up")
+                
+        except Exception as e:
+            logger.warning(f"Model warm-up failed (non-critical): {e}")
 
-        # Metrics
-        self.classification_count = 0
-        self.dossier_count = 0
-        self.embedding_count = 0
-        self.cache_enabled = self.settings.enable_response_cache
+    async def start_background_warmup(self):
+        """Start background model warm-up task."""
+        if not self.settings.enable_health_monitoring:
+            return
+            
+        try:
+            # Run warm-up in background
+            asyncio.create_task(self._background_warmup_loop())
+        except Exception as e:
+            logger.error(f"Failed to start background warmup: {e}")
 
-        logger.info(f"OllamaManager initialized: 1B={self.model_1b}, 4B={self.model_4b}, cache={self.cache_enabled}")
-
-    def _select_model_1b(self) -> str:
-        """Select 1B model based on configuration."""
-        if self.settings.use_quantized_models:
-            logger.info(f"Using quantized 1B model: {self.settings.quantized_model_1b}")
-            return self.settings.quantized_model_1b
-        return self.settings.ollama_model_1b
-
-    def _select_model_4b(self) -> str:
-        """Select 4B model based on configuration."""
-        if self.settings.use_quantized_models:
-            logger.info(f"Using quantized 4B model: {self.settings.quantized_model_4b}")
-            return self.settings.quantized_model_4b
-        return self.settings.ollama_model_4b
-
-    def _calculate_context_window(self, text: str) -> int:
-        """
-        Dynamically calculate context window based on input length.
-
-        Args:
-            text: Input text to analyze
-
-        Returns:
-            Appropriate context window size
-        """
-        text_length = len(text)
-
-        if text_length < self.settings.context_length_threshold:
-            return self.settings.context_window_1b_short
-        else:
-            return self.settings.context_window_1b_long
+    async def _background_warmup_loop(self):
+        """Background loop to keep models warm."""
+        while True:
+            try:
+                await asyncio.sleep(300)  # Warm up every 5 minutes
+                await self.warm_up_models()
+            except Exception as e:
+                logger.warning(f"Background warmup failed: {e}")
+                await asyncio.sleep(60)  # Wait before retrying
 
     async def ensure_models_loaded(self):
-        """Ensure all required models are available in Ollama."""
+        """Ensure optimal models are available, prioritizing quantized versions for performance."""
         try:
             models = await self._list_models()
             model_names = [m["name"] for m in models]
-
-            # Check and pull required models
-            required_models = [self.model_1b, self.model_4b]
-            if self.settings.enable_embeddings:
-                required_models.append(self.embedding_model)
-
-            for model in required_models:
-                if model not in model_names:
-                    logger.warning(f"Model {model} not found. Pulling...")
-                    await self._pull_model(model)
-
-            logger.info(f"✅ All models ready: {', '.join(required_models)}")
-
-            # Initial health check
-            if self.health_monitor:
-                await self.health_monitor.check_health(self.client)
-
+            
+            # Check quantized models first if enabled
+            if self.settings.use_quantized_models:
+                quantized_1b_available = self.settings.quantized_model_1b in model_names
+                quantized_4b_available = self.settings.quantized_model_4b in model_names
+                
+                if quantized_1b_available and quantized_4b_available:
+                    self.model_1b = self.settings.quantized_model_1b
+                    self.model_4b = self.settings.quantized_model_4b
+                    logger.info(f"✅ Using quantized models: {self.model_1b}, {self.model_4b}")
+                    return
+                else:
+                    # Fallback to full models if quantized not available
+                    logger.warning("Quantized models not available, falling back to full models")
+                    if not quantized_1b_available:
+                        logger.warning(f"Quantized 1B model {self.settings.quantized_model_1b} not found")
+                    if not quantized_4b_available:
+                        logger.warning(f"Quantized 4B model {self.settings.quantized_model_4b} not found")
+            
+            # Use full models (either by config or fallback)
+            self.model_1b = self.settings.ollama_model_1b
+            self.model_4b = self.settings.ollama_model_4b
+            
+            # Ensure full models are available
+            models_to_check = []
+            if self.model_1b not in model_names:
+                models_to_check.append(self.model_1b)
+            if self.model_4b not in model_names:
+                models_to_check.append(self.model_4b)
+            
+            for model_name in models_to_check:
+                logger.warning(f"Model {model_name} not found. Pulling...")
+                await self._pull_model(model_name)
+            
+            logger.info(f"✅ Models ready: {self.model_1b}, {self.model_4b}")
+            
+            # Start background warm-up if monitoring enabled
+            await self.start_background_warmup()
+            
         except Exception as e:
-            logger.error(f"Error checking Ollama models: {e}")
-            raise
+            logger.error(f"Error ensuring models are loaded: {e}")
+            # Don't raise if we can continue with basic functionality
+            logger.warning("Continuing with basic API functionality - AI features disabled")
+            self.model_1b = None
+            self.model_4b = None
 
     async def _list_models(self) -> list:
         """List available models in Ollama."""
@@ -206,264 +173,31 @@ class OllamaManager:
             logger.error(f"Error pulling model {model_name}: {e}")
             raise
 
-    async def _periodic_health_check(self):
-        """Perform periodic health check if due."""
-        if self.health_monitor and self.health_monitor.should_check():
-            await self.health_monitor.check_health(self.client)
-
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception_type((httpx.TimeoutException, httpx.ConnectError, httpx.ReadTimeout)),
+        reraise=True
+    )
     async def classify_signal(
         self,
         signal_text: str,
         icp_context: Optional[Dict[str, Any]] = None,
-        use_cache: bool = True,
-        stream: bool = False,
     ) -> Dict[str, Any]:
         """
-        Use 1B model to quickly classify a signal.
-
-        Args:
-            signal_text: The signal text to classify
-            icp_context: Optional ICP context dict
-            use_cache: Whether to use cache (default True)
-            stream: Whether to stream the response (default False)
-
-        Returns:
-            Classification dict with scores, tags, SPIN fields
+        Use Gemma 3 1B to quickly classify a signal.
+        Returns structured JSON with ICP match, pain score, tags, SPIN/MEDDIC fields.
         """
-        # Periodic health check
-        await self._periodic_health_check()
-
-        # Check cache first
-        cache_manager = get_cache_manager()
-        if use_cache and cache_manager and self.cache_enabled:
-            icp_str = json.dumps(icp_context) if icp_context else None
-            cached_result = await cache_manager.get(
-                signal_text=signal_text,
-                icp_context=icp_str,
-                model="1b"
-            )
-            if cached_result:
-                logger.debug("Using cached classification result")
-                return cached_result
-
-        # Build prompt from template
-        prompt_manager = get_prompt_manager()
-        if prompt_manager:
-            icp_context_str = self._format_icp_context(icp_context) if icp_context else "No ICP context provided."
-            prompt = prompt_manager.render_template(
-                "classification",
-                icp_context=icp_context_str,
-                signal_text=signal_text
-            )
-        else:
-            # Fallback to inline prompt
-            prompt = self._build_classification_prompt(signal_text, icp_context)
-
-        # Dynamic context window
-        context_window = self._calculate_context_window(signal_text)
-
-        try:
-            # Streaming not supported for classification (needs full JSON)
-            response = await self.client.post(
-                f"{self.base_url}/api/generate",
-                json={
-                    "model": self.model_1b,
-                    "prompt": prompt,
-                    "stream": False,
-                    "options": {
-                        "temperature": self.settings.temperature_1b,
-                        "top_p": 0.9,
-                        "top_k": 40,
-                        "num_ctx": context_window,
-                    },
-                },
-            )
-            response.raise_for_status()
-            data = response.json()
-            response_text = data.get("response", "").strip()
-
-            # Parse JSON
-            result = self._parse_json_response(response_text, self._default_classification())
-
-            # Cache the result
-            if use_cache and cache_manager and self.cache_enabled:
-                icp_str = json.dumps(icp_context) if icp_context else None
-                await cache_manager.set(
-                    signal_text=signal_text,
-                    value=result,
-                    icp_context=icp_str,
-                    model="1b"
-                )
-
-            self.classification_count += 1
-            return result
-
-        except Exception as e:
-            logger.error(f"Error in classify_signal: {e}")
-            return self._default_classification()
-
-    async def generate_dossier(
-        self,
-        lead_json: Dict[str, Any],
-        signal_snippets: list,
-        stream: bool = False,
-    ) -> Dict[str, str]:
-        """
-        Use 4B model to generate rich context dossier for a hot lead.
-
-        Args:
-            lead_json: Lead classification data
-            signal_snippets: List of signal snippets
-            stream: Whether to stream the response
-
-        Returns:
-            Dossier dict with strategic insights
-        """
-        # Periodic health check
-        await self._periodic_health_check()
-
-        snippets_text = "\n".join([f"- {s}" for s in signal_snippets[:5]])
-
-        # Build prompt from template
-        prompt_manager = get_prompt_manager()
-        if prompt_manager:
-            prompt = prompt_manager.render_template(
-                "dossier",
-                signal_text=snippets_text,
-                classification_json=json.dumps(lead_json, indent=2)
-            )
-        else:
-            # Fallback to inline prompt
-            prompt = self._build_dossier_prompt(lead_json, snippets_text)
-
-        try:
-            if stream and self.settings.enable_streaming:
-                # Streaming not fully implemented for JSON (complex to parse incrementally)
-                # For now, use non-streaming
-                logger.warning("Streaming requested for dossier but not fully supported for JSON parsing")
-
-            response = await self.client.post(
-                f"{self.base_url}/api/generate",
-                json={
-                    "model": self.model_4b,
-                    "prompt": prompt,
-                    "stream": False,
-                    "options": {
-                        "temperature": self.settings.temperature_4b,
-                        "top_p": 0.9,
-                        "num_ctx": self.settings.context_window_4b,
-                    },
-                },
-            )
-            response.raise_for_status()
-            data = response.json()
-            response_text = data.get("response", "").strip()
-
-            result = self._parse_json_response(response_text, self._default_dossier())
-
-            self.dossier_count += 1
-            return result
-
-        except Exception as e:
-            logger.error(f"Error in generate_dossier: {e}")
-            return self._default_dossier()
-
-    async def generate_embedding(
-        self,
-        text: str,
-        use_cache: bool = True
-    ) -> Optional[list[float]]:
-        """
-        Generate embeddings for text using embedding model.
-
-        Args:
-            text: Text to embed
-            use_cache: Whether to use cache
-
-        Returns:
-            List of floats (embedding vector) or None on failure
-        """
-        if not self.settings.enable_embeddings:
-            logger.warning("Embeddings not enabled in settings")
-            return None
-
         # Check cache
-        cache_manager = get_cache_manager()
-        if use_cache and cache_manager and self.cache_enabled:
-            cached_result = await cache_manager.get(
-                signal_text=text,
-                model="embedding"
-            )
-            if cached_result and "embedding" in cached_result:
-                logger.debug("Using cached embedding")
-                return cached_result["embedding"]
+        if self.cache_manager:
+            cached = await self.cache_manager.get(signal_text, str(icp_context), self.model_1b)
+            if cached:
+                return cached
 
-        try:
-            response = await self.client.post(
-                f"{self.base_url}/api/embeddings",
-                json={
-                    "model": self.embedding_model,
-                    "prompt": text
-                }
-            )
-            response.raise_for_status()
-            data = response.json()
-            embedding = data.get("embedding")
-
-            if embedding:
-                # Cache the embedding
-                if use_cache and cache_manager and self.cache_enabled:
-                    await cache_manager.set(
-                        signal_text=text,
-                        value={"embedding": embedding},
-                        model="embedding",
-                        ttl=self.settings.embedding_cache_ttl
-                    )
-
-                self.embedding_count += 1
-                return embedding
-            else:
-                logger.error("No embedding returned from Ollama")
-                return None
-
-        except Exception as e:
-            logger.error(f"Error generating embedding: {e}")
-            return None
-
-    async def compute_similarity(self, embedding1: list[float], embedding2: list[float]) -> float:
-        """
-        Compute cosine similarity between two embeddings.
-
-        Args:
-            embedding1: First embedding vector
-            embedding2: Second embedding vector
-
-        Returns:
-            Similarity score between -1 and 1
-        """
-        try:
-            # Cosine similarity
-            import numpy as np
-            vec1 = np.array(embedding1)
-            vec2 = np.array(embedding2)
-
-            dot_product = np.dot(vec1, vec2)
-            norm1 = np.linalg.norm(vec1)
-            norm2 = np.linalg.norm(vec2)
-
-            if norm1 == 0 or norm2 == 0:
-                return 0.0
-
-            similarity = dot_product / (norm1 * norm2)
-            return float(similarity)
-
-        except Exception as e:
-            logger.error(f"Error computing similarity: {e}")
-            return 0.0
-
-    def _format_icp_context(self, icp_context: Dict[str, Any]) -> str:
-        """Format ICP context for prompt."""
-        return f"""
+        # Build classifier prompt
+        icp_info = ""
+        if icp_context:
+            icp_info = f"""
 ICP Context:
 - Size buckets: {icp_context.get('size_buckets', [])}
 - Industries: {icp_context.get('industries', [])}
@@ -471,43 +205,127 @@ ICP Context:
 - Hiring keywords: {icp_context.get('hiring_keywords', [])}
 """
 
-    def _build_classification_prompt(self, signal_text: str, icp_context: Optional[Dict[str, Any]]) -> str:
-        """Build classification prompt (fallback when template manager not available)."""
-        icp_info = self._format_icp_context(icp_context) if icp_context else ""
+        prompt = f"""You are an elite lead qualification AI for enterprise sales teams. Focus on HIGH-VALUE targets only.
 
-        return f"""You are a lead classifier for Raptorflow, a marketing SaaS platform focused on small teams (<20 people) in India.
-Analyze the signal text and return STRICT JSON. No extra text. ONLY JSON.
+QUALIFICATION CRITERIA:
+- Target: Founders, CEOs, CTOs, CMOs, VPs, Directors, Heads of Marketing
+- Company Size: 10+ employees (ignore solo operators and tiny teams)
+- Focus: Decision-makers with real pain and budget authority
+- Avoid: Junior roles, individual contributors, entry-level hiring
 
 {icp_info}
 
-Signal Text:
+Signal Analysis:
 {signal_text}
 
-Return exactly this JSON structure:
+Return STRICT JSON:
 {{
     "icp_match": true/false,
-    "size_bucket": "1" or "2-5" or "6-10" or "11-20" or "unknown",
-    "region": "india" or "other" or "unknown",
-    "role_type": "first_marketer" or "agency_replacement" or "extra_headcount" or "unclear",
-    "pain_tags": ["list", "of", "tags"],
+    "decision_making_level": "founder_ceo" or "c_level" or "vp_director" or "manager" or "individual" or "unknown",
+    "company_size_estimate": "startup_1_10" or "small_11_50" or "medium_51_200" or "large_200_plus" or "enterprise_1000_plus",
+    "budget_authority": "high_yes" or "medium_maybe" or "low_no",
+    "role_type": "marketing_leader" or "founder_ceo" or "cto_tech" or "sales_director" or "agency_replacement" or "unclear",
+    "target_priority": "strategic_gold" or "high_value" or "medium_potential" or "low_pass",
+    "pain_tags": ["list", "critical", "pain", "points"],
     "score_fit": 0-50,
     "score_pain": 0-40,
     "score_data_quality": 0-10,
-    "reason_short": "max 25 words",
+    "score_executive_level": 0-30,
+    "score_budget_potential": 0-20,
+    "reason_short": "max 25 words why this is/isn't a high-value target",
     "situation": "max 40 words",
     "problem": "max 40 words",
     "implication": "max 40 words",
     "need_payoff": "max 40 words",
-    "economic_buyer_guess": "founder or ceo or gm or other",
+    "economic_buyer_guess": "founder or ceo or cmo or cto or vp or director or gm or other",
     "key_pain": "max 40 words",
     "chaos_flags": ["list", "of", "flags"],
-    "silver_bullet_phrases": ["list", "of", "phrases"]
+    "silver_bullet_phrases": ["list", "of", "phrases"],
+    "urgency_level": "immediate_crisis" or "quarterly_priority" or "future_plan" or "nice_to_have"
 }}"""
 
-    def _build_dossier_prompt(self, lead_json: Dict[str, Any], snippets_text: str) -> str:
-        """Build dossier prompt (fallback when template manager not available)."""
-        return f"""You are a senior growth advisor for Raptorflow, a marketing SaaS platform.
-Given structured lead data + signal snippets, generate sharp, non-fluffy context.
+        try:
+            response = await self.client.post(
+                f"{self.base_url}/api/generate",
+                json={
+                    "model": self.model_1b,
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {
+                        "temperature": 0.3,  # Lower temperature for consistent JSON
+                        "top_p": 0.9,
+                        "top_k": 40,
+                        "num_ctx": 4096,  # Keep context small for 1B
+                        **self._get_gpu_options()  # Add GPU acceleration if enabled
+                    },
+                },
+            )
+            response.raise_for_status()
+            data = response.json()
+            response_text = data.get("response", "").strip()
+
+            # Try to extract JSON from response
+            try:
+                # Try direct JSON parse
+                result = json.loads(response_text)
+            except json.JSONDecodeError as parse_err:
+                # Try to find JSON in the response
+                start_idx = response_text.find("{")
+                end_idx = response_text.rfind("}") + 1
+                if start_idx >= 0 and end_idx > start_idx:
+                    try:
+                        result = json.loads(response_text[start_idx:end_idx])
+                    except json.JSONDecodeError as nested_err:
+                        logger.error(f"🔴 1B Model response parsing failed: {nested_err}")
+                        logger.error(f"   Response text: {response_text[:300]}")
+                        logger.warning("Using default classification (score: 0) as fallback")
+                        result = self._default_classification()
+                else:
+                    logger.error(f"🔴 No JSON found in 1B model response")
+                    logger.error(f"   Response: {response_text[:300]}")
+                    logger.warning("Using default classification (score: 0) as fallback")
+                    result = self._default_classification()
+
+            # Cache the result
+            if self.cache_manager:
+                await self.cache_manager.set(signal_text, result, str(icp_context), self.model_1b)
+
+            return result
+        except httpx.TimeoutException as e:
+            logger.error(f"🔴 TIMEOUT: 1B Model took too long to respond (>300s)")
+            logger.error(f"   This usually means the model is overloaded or frozen")
+            logger.warning("Returning default classification due to timeout")
+            return self._default_classification()
+        except httpx.ConnectError as e:
+            logger.error(f"🔴 Connection lost to Ollama: {e}")
+            logger.warning("Returning default classification due to connection error")
+            return self._default_classification()
+        except Exception as e:
+            logger.error(f"🔴 Error in classify_signal: {type(e).__name__}: {e}")
+            return self._default_classification()
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception_type((httpx.TimeoutException, httpx.ConnectError, httpx.ReadTimeout)),
+        reraise=True
+    )
+    async def generate_dossier(
+        self,
+        lead_json: Dict[str, Any],
+        signal_snippets: list,
+    ) -> Dict[str, str]:
+        """
+        Use Gemma 3 4B to generate rich context dossier for a hot lead.
+        Only call this for leads scoring >70.
+        """
+        snippets_text = "\n".join([f"- {s}" for s in signal_snippets[:5]])  # Max 5 snippets
+
+        prompt = f"""You are a world-class sales intelligence analyst with 15 years experience selling to marketing leaders.
+You have access to proprietary lead intelligence that NO OTHER SALESPERSON has.
+
+Analyze this lead data and generate DEEP, ACTIONABLE context using military-grade research techniques.
+The goal: Give salespeople UNFAIR competitive advantage with insights competitors can't access.
 
 Lead Data:
 {json.dumps(lead_json, indent=2)}
@@ -515,33 +333,286 @@ Lead Data:
 Signal Snippets:
 {snippets_text}
 
-Return STRICT JSON with these fields:
+Return STRICT JSON with these fields (provide MAXIMUM unique intelligence):
+
 {{
-    "snapshot": "40 words max, one sentence on who they are",
-    "why_pain_bullets": ["bullet 1 why they have marketing pain", "bullet 2", "bullet 3"],
-    "uncomfortable_truth": "1-2 sentences on what happens if they don't fix this",
-    "reframe_suggestion": "1 strong reframe sentence flipping their thinking",
-    "best_angle_bullets": ["angle 1 to approach them", "angle 2", "angle 3"],
-    "challenger_insight": "The one uncomfortable truth to lead with"
+    "snapshot": "45 words exactly: who they are, business stage, monetization status, team size, pain urgency",
+    "hidden_motivations": [
+        "Their real reason for hiring (beyond obvious job description)",
+        "What they're actually struggling with that they won't admit",
+        "Their personality-driven pain (founder ego, team drama, investor pressure)"
+    ],
+    "competitive_threats": [
+        "How competitors are already winning their business",
+        "Their dead-end marketing strategies you're seeing signals of",
+        "Why their current agency/employee is failing them"
+    ],
+    "psychological_profile": {{
+        "decision_style": "autocratic/collaborative/risk-averse/adventurous",
+        "pain_tolerance": "low/high/breaking_point",
+        "trust_barriers": "What makes them skeptical of outsiders",
+        "motivation_triggers": "What stories/values resonate with them"
+    }},
+    "uncomfortable_truth": "2 sentences maximum: the brutal reality they need to face that no one tells them",
+    "reframe_suggestion": "1 killer sentence that completely flips their worldview and positions you as the obvious solution",
+    "attack_strategy": {{
+        "opening_sequence": "How to create immediate rapport and credibility",
+        "value_stacking": ["3 specific outcomes they get day 1, week 1, month 1"],
+        "objection_preemption": ["The 2 objections they'll raise and how to disarm them"],
+        "closing_signals": ["4 behaviors indicating they're ready to buy"]
+    }},
+    "challenger_insight": "The ONE assumption they hold that's destroying their business - demolish it",
+    "unique_intelligence": {{
+        "market_signals": "What their job post reveals about market changes they're missing",
+        "competitor_weakness": "How you can exploit gaps in their competitive landscape",
+        "timing_opportunity": "Why NOW is the perfect moment to approach them"
+    }}
 }}"""
 
-    def _parse_json_response(self, response_text: str, default: Dict[str, Any]) -> Dict[str, Any]:
-        """Parse JSON from model response with fallback."""
         try:
-            return json.loads(response_text)
-        except json.JSONDecodeError:
-            # Try to find JSON in the response
-            start_idx = response_text.find("{")
-            end_idx = response_text.rfind("}") + 1
-            if start_idx >= 0 and end_idx > start_idx:
-                try:
-                    return json.loads(response_text[start_idx:end_idx])
-                except json.JSONDecodeError:
-                    logger.warning(f"Could not parse JSON from response: {response_text[:200]}")
-                    return default
-            else:
-                logger.warning(f"No JSON found in response: {response_text[:200]}")
-                return default
+            response = await self.client.post(
+                f"{self.base_url}/api/generate",
+                json={
+                    "model": self.model_4b,
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {
+                        "temperature": 0.5,  # Slightly higher for better narrative
+                        "top_p": 0.9,
+                        "num_ctx": 8192,  # 4B can handle more context
+                        **self._get_gpu_options()  # Add GPU acceleration if enabled
+                    },
+                },
+            )
+            response.raise_for_status()
+            data = response.json()
+            response_text = data.get("response", "").strip()
+
+            try:
+                result = json.loads(response_text)
+            except json.JSONDecodeError as parse_err:
+                start_idx = response_text.find("{")
+                end_idx = response_text.rfind("}") + 1
+                if start_idx >= 0 and end_idx > start_idx:
+                    try:
+                        result = json.loads(response_text[start_idx:end_idx])
+                    except json.JSONDecodeError as nested_err:
+                        logger.error(f"🔴 4B Dossier response parsing failed: {nested_err}")
+                        logger.error(f"   Response: {response_text[:300]}")
+                        logger.warning("Using default dossier as fallback")
+                        result = self._default_dossier()
+                else:
+                    logger.error(f"🔴 No JSON found in 4B dossier response")
+                    logger.error(f"   Response: {response_text[:300]}")
+                    logger.warning("Using default dossier as fallback")
+                    result = self._default_dossier()
+
+            return result
+        except httpx.TimeoutException as e:
+            logger.error(f"🔴 TIMEOUT: 4B Dossier model took too long (>300s)")
+            logger.error(f"   This usually means the model is overloaded")
+            logger.warning("Using default dossier (skipping enrichment)")
+            return self._default_dossier()
+        except httpx.ConnectError as e:
+            logger.error(f"🔴 Connection lost to Ollama during dossier generation: {e}")
+            logger.warning("Using default dossier")
+            return self._default_dossier()
+        except Exception as e:
+            logger.error(f"🔴 Error generating dossier: {type(e).__name__}: {e}")
+            logger.warning("Returning default dossier due to error")
+            return self._default_dossier()
+
+    async def classify_signal_streaming(
+        self,
+        signal_text: str,
+        icp_context: Optional[Dict[str, Any]] = None,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Stream classification results in real-time."""
+        if not self.settings.enable_streaming:
+            # Fallback to non-streaming
+            result = await self.classify_signal(signal_text, icp_context)
+            yield result
+            return
+
+        # Build classifier prompt (same as non-streaming)
+        icp_info = ""
+        if icp_context:
+            icp_info = f"""
+ICP Context:
+- Size buckets: {icp_context.get('size_buckets', [])}
+- Industries: {icp_context.get('industries', [])}
+- Pain keywords: {icp_context.get('pain_keywords', [])}
+- Hiring keywords: {icp_context.get('hiring_keywords', [])}
+"""
+
+        prompt = f"""You are an elite lead qualification AI for enterprise sales teams. Focus on HIGH-VALUE targets only.
+
+QUALIFICATION CRITERIA:
+- Target: Founders, CEOs, CTOs, CMOs, VPs, Directors, Heads of Marketing
+- Company Size: 10+ employees (ignore solo operators and tiny teams)
+- Focus: Decision-makers with real pain and budget authority
+- Avoid: Junior roles, individual contributors, entry-level hiring
+
+{icp_info}
+
+Signal Analysis:
+{signal_text}
+
+Return STRICT JSON:
+{{
+    "icp_match": true/false,
+    "decision_making_level": "founder_ceo" or "c_level" or "vp_director" or "manager" or "individual" or "unknown",
+    "company_size_estimate": "startup_1_10" or "small_11_50" or "medium_51_200" or "large_200_plus" or "enterprise_1000_plus",
+    "budget_authority": "high_yes" or "medium_maybe" or "low_no",
+    "role_type": "marketing_leader" or "founder_ceo" or "cto_tech" or "sales_director" or "agency_replacement" or "unclear",
+    "target_priority": "strategic_gold" or "high_value" or "medium_potential" or "low_pass",
+    "pain_tags": ["list", "critical", "pain", "points"],
+    "score_fit": 0-50,
+    "score_pain": 0-40,
+    "score_data_quality": 0-10,
+    "score_executive_level": 0-30,
+    "score_budget_potential": 0-20,
+    "reason_short": "max 25 words why this is/isn't a high-value target",
+    "situation": "max 40 words",
+    "problem": "max 40 words",
+    "implication": "max 40 words",
+    "need_payoff": "max 40 words",
+    "economic_buyer_guess": "founder or ceo or cmo or cto or vp or director or gm or other",
+    "key_pain": "max 40 words",
+    "chaos_flags": ["list", "of", "flags"],
+    "silver_bullet_phrases": ["list", "of", "phrases"],
+    "urgency_level": "immediate_crisis" or "quarterly_priority" or "future_plan" or "nice_to_have"
+}}"""
+
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, read=300.0)) as client:
+                response = await client.post(
+                    f"{self.base_url}/api/generate",
+                    json={
+                        "model": self.model_1b,
+                        "prompt": prompt,
+                        "stream": True,  # Enable streaming
+                        "options": {
+                            "temperature": 0.3,
+                            "top_p": 0.9,
+                            "top_k": 40,
+                            "num_ctx": 4096,
+                            **self._get_gpu_options()
+                        }
+                    },
+                )
+                
+                response.raise_for_status()
+                
+                # Stream response
+                async for line in response.aiter_lines():
+                    if line.strip():
+                        try:
+                            data = json.loads(line)
+                            if data.get("done", False):
+                                break
+                            if "response" in data:
+                                yield {"chunk": data["response"], "done": False}
+                        except json.JSONDecodeError:
+                            continue
+                
+                # Final result
+                yield {"done": True, "message": "Classification complete"}
+                
+        except Exception as e:
+            logger.error(f"Streaming classification failed: {e}")
+            yield {"error": str(e), "done": True}
+
+    async def generate_dossier_streaming(
+        self,
+        lead_json: Dict[str, Any],
+        signal_snippets: list,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Stream dossier generation in real-time."""
+        if not self.settings.enable_streaming:
+            # Fallback to non-streaming
+            result = await self.generate_dossier(lead_json, signal_snippets)
+            yield result
+            return
+
+        snippets_text = "\n".join([f"- {s}" for s in signal_snippets[:5]])
+        prompt = f"""You are a world-class sales intelligence analyst with 15 years experience selling to marketing leaders.
+
+Analyze this lead data and generate DEEP, ACTIONABLE context using military-grade research techniques.
+
+Lead Data:
+{json.dumps(lead_json, indent=2)}
+
+Signal Snippets:
+{snippets_text}
+
+Return STRICT JSON with these fields..."""  # Truncated for brevity
+
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, read=300.0)) as client:
+                response = await client.post(
+                    f"{self.base_url}/api/generate",
+                    json={
+                        "model": self.model_4b,
+                        "prompt": prompt,
+                        "stream": True,
+                        "options": {
+                            "temperature": 0.5,
+                            "top_p": 0.9,
+                            "num_ctx": 8192,
+                            **self._get_gpu_options()
+                        }
+                    },
+                )
+                
+                response.raise_for_status()
+                
+                async for line in response.aiter_lines():
+                    if line.strip():
+                        try:
+                            data = json.loads(line)
+                            if data.get("done", False):
+                                break
+                            if "response" in data:
+                                yield {"chunk": data["response"], "done": False}
+                        except json.JSONDecodeError:
+                            continue
+                
+                yield {"done": True, "message": "Dossier generation complete"}
+                
+        except Exception as e:
+            logger.error(f"Streaming dossier generation failed: {e}")
+            yield {"error": str(e), "done": True}
+
+    def _get_gpu_options(self) -> Dict[str, Any]:
+        """Get GPU acceleration options if enabled in configuration."""
+        if not self.settings.enable_gpu_acceleration:
+            return {}
+        
+        gpu_options = {}
+        
+        # Set GPU backend
+        if self.settings.gpu_backend != "auto":
+            gpu_options["backend"] = self.settings.gpu_backend
+        
+        # Set device ID if specified
+        if self.settings.gpu_device_id != 0:
+            gpu_options["device"] = f"{self.settings.gpu_backend}:{self.settings.gpu_device_id}"
+        
+        # Set memory limit if specified
+        if self.settings.gpu_memory_limit:
+            gpu_options["gpu_memory_utilization"] = 0.9  # Use 90% of available memory
+        
+        # Set thread count
+        if self.settings.gpu_threads > 1:
+            gpu_options["num_thread"] = self.settings.gpu_threads
+        
+        # Set batch size for parallel processing
+        if self.settings.gpu_batch_size > 1:
+            gpu_options["batch_size"] = self.settings.gpu_batch_size
+        
+        logger.debug(f"Using GPU options: {gpu_options}")
+        return gpu_options
 
     def _default_classification(self) -> Dict[str, Any]:
         """Default classification when model fails."""
@@ -576,41 +647,178 @@ Return STRICT JSON with these fields:
             "challenger_insight": "Unable to generate insight.",
         }
 
-    def get_stats(self) -> Dict[str, Any]:
-        """Get OllamaManager statistics."""
-        stats = {
-            "model_1b": self.model_1b,
-            "model_4b": self.model_4b,
-            "embedding_model": self.embedding_model,
-            "classification_count": self.classification_count,
-            "dossier_count": self.dossier_count,
-            "embedding_count": self.embedding_count,
-            "cache_enabled": self.cache_enabled,
-        }
 
-        # Add health stats if monitoring enabled
-        if self.health_monitor:
-            stats["health"] = self.health_monitor.get_stats()
-
-        # Add cache stats
-        cache_manager = get_cache_manager()
-        if cache_manager:
-            stats["cache"] = cache_manager.get_stats()
-
-        return stats
+def _compute_score_bucket(total_score: float) -> str:
+    """Map numeric score to bucket labels."""
+    if total_score >= 80:
+        return "red_hot"
+    if total_score >= 60:
+        return "warm"
+    if total_score >= 40:
+        return "nurture"
+    return "parked"
 
 
-# Singleton instance (initialized in main.py)
+def classify_signal_with_ollama(
+    signal_text: str,
+    company_name: Optional[str] = None,
+    company_website: Optional[str] = None,
+    icp_context: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Synchronous helper used by scraping pipelines to classify a signal via Ollama.
+
+    This keeps the scraping service (which runs in sync contexts) working without
+    needing an event loop. It mirrors the async classifier logic but uses the
+    blocking httpx client.
+    """
+    settings = Settings()
+    manager = OllamaManager()  # For defaults + model names
+    icp_context = icp_context or {}
+    cache_manager = get_cache_manager()
+
+    # Check cache (sync)
+    if cache_manager:
+        cached = cache_manager.get_sync(signal_text, str(icp_context), manager.model_1b)
+        if cached:
+            # Ensure normalized score is present if cached raw result
+            if "total_score" not in cached:
+                 # Re-calculate derived fields if needed, or assume cached is the full normalized object
+                 # The async set() stores the RAW result from Ollama (JSON) or the processed one?
+                 # In async classify_signal, we store 'result' which is the parsed JSON from Ollama.
+                 # We need to process it below to add total_score etc.
+                 pass
+            else:
+                 return cached # If we cached the final result
+
+    icp_info = ""
+    if icp_context:
+        icp_info = f"""
+ICP Context:
+- Size buckets: {icp_context.get('size_buckets', [])}
+- Industries: {icp_context.get('industries', [])}
+- Pain keywords: {icp_context.get('pain_keywords', [])}
+- Hiring keywords: {icp_context.get('hiring_keywords', [])}
+"""
+
+    prompt = f"""You are an elite lead qualification AI for enterprise sales teams. Focus on HIGH-VALUE targets only.
+
+QUALIFICATION CRITERIA:
+- Target: Founders, CEOs, CTOs, CMOs, VPs, Directors, Heads of Marketing
+- Company Size: 10+ employees (ignore solo operators and tiny teams)
+- Focus: Decision-makers with real pain and budget authority
+- Avoid: Junior roles, individual contributors, entry-level hiring
+
+{icp_info}
+
+Signal Analysis:
+{signal_text}
+
+Return STRICT JSON:
+{{
+    "icp_match": true/false,
+    "decision_making_level": "founder_ceo" or "c_level" or "vp_director" or "manager" or "individual" or "unknown",
+    "company_size_estimate": "startup_1_10" or "small_11_50" or "medium_51_200" or "large_200_plus" or "enterprise_1000_plus",
+    "budget_authority": "high_yes" or "medium_maybe" or "low_no",
+    "role_type": "marketing_leader" or "founder_ceo" or "cto_tech" or "sales_director" or "agency_replacement" or "unclear",
+    "target_priority": "strategic_gold" or "high_value" or "medium_potential" or "low_pass",
+    "pain_tags": ["list", "critical", "pain", "points"],
+    "score_fit": 0-50,
+    "score_pain": 0-40,
+    "score_data_quality": 0-10,
+    "score_executive_level": 0-30,
+    "score_budget_potential": 0-20,
+    "reason_short": "max 25 words why this is/isn't a high-value target",
+    "situation": "max 40 words",
+    "problem": "max 40 words",
+    "implication": "max 40 words",
+    "need_payoff": "max 40 words",
+    "economic_buyer_guess": "founder or ceo or cmo or cto or vp or director or gm or other",
+    "key_pain": "max 40 words",
+    "chaos_flags": ["list", "of", "flags"],
+    "silver_bullet_phrases": ["list", "of", "phrases"],
+    "urgency_level": "immediate_crisis" or "quarterly_priority" or "future_plan" or "nice_to_have"
+}}"""
+
+    try:
+        with httpx.Client(timeout=httpx.Timeout(10.0, read=300.0)) as client:
+            response = client.post(
+                f"{settings.ollama_base_url}/api/generate",
+                json={
+                    "model": manager.model_1b,
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {
+                        "temperature": settings.temperature_1b,
+                        "top_p": 0.9,
+                        "top_k": 40,
+                        "num_ctx": settings.context_window_1b_short,
+                    },
+                },
+            )
+            response.raise_for_status()
+            data = response.json()
+            response_text = data.get("response", "").strip()
+
+        try:
+            classification = json.loads(response_text)
+        except json.JSONDecodeError:
+            start_idx = response_text.find("{")
+            end_idx = response_text.rfind("}") + 1
+            if start_idx >= 0 and end_idx > start_idx:
+                classification = json.loads(response_text[start_idx:end_idx])
+            else:
+                logger.warning("Could not parse classification JSON; using default.")
+                classification = manager._default_classification()
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.error(f"Classification via Ollama failed: {exc}")
+        classification = manager._default_classification()
+
+    total_score = (
+        classification.get("score_fit", 0)
+        + classification.get("score_pain", 0)
+        + classification.get("score_data_quality", 0)
+    )
+    score_bucket = _compute_score_bucket(total_score)
+
+    # Normalize output to match Lead columns expected by scraping_service
+    result = {
+        "icp_match": classification.get("icp_match", False),
+        "score_icp_fit": classification.get("score_fit", 0),
+        "score_marketing_pain": classification.get("score_pain", 0),
+        "score_data_quality": classification.get("score_data_quality", 0),
+        "total_score": total_score,
+        "score_bucket": score_bucket,
+        "icp_matches": classification.get("icp_matches", []),
+        "role_type": classification.get("role_type", "unclear"),
+        "pain_tags": classification.get("pain_tags", []),
+        "situation": classification.get("situation", ""),
+        "problem": classification.get("problem", ""),
+        "implication": classification.get("implication", ""),
+        "need_payoff": classification.get("need_payoff", ""),
+        "economic_buyer_guess": classification.get("economic_buyer_guess", "unknown"),
+        "key_pain": classification.get("key_pain", ""),
+        "chaos_flags": classification.get("chaos_flags", []),
+        "silver_bullet_phrases": classification.get("silver_bullet_phrases", []),
+        "status": "new",
+    }
+
+    # Cache the FINAL processed result
+    if cache_manager:
+        cache_manager.set_sync(signal_text, result, str(icp_context), manager.model_1b)
+
+    return result
+
+
 _ollama_manager: Optional[OllamaManager] = None
 
 
 def get_ollama_manager() -> Optional[OllamaManager]:
-    """Get the singleton OllamaManager instance."""
     return _ollama_manager
 
 
 def init_ollama_manager() -> OllamaManager:
-    """Initialize the singleton OllamaManager."""
     global _ollama_manager
-    _ollama_manager = OllamaManager()
+    if _ollama_manager is None:
+        _ollama_manager = OllamaManager()
     return _ollama_manager

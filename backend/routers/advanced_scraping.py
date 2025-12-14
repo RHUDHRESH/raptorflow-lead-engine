@@ -98,7 +98,7 @@ async def crawl_website(
                 "lead_id": classification_result.lead_id,
                 "total_score": classification_result.total_score,
                 "score_bucket": classification_result.score_bucket,
-                "company_name": classification_result.company_name,
+                "company_name": crawled_data.get('domain'),
             }
 
         return result

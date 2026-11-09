@@ -1,15 +1,13 @@
-# 🚀 Raptorflow Lead Engine
+# Raptorflow Lead Engine
 
-**Local-first lead discovery & enrichment. Runs 100% on your machine.**
+**Local-first lead discovery and enrichment.** Find companies with marketing pain, classify and score the signals, and get context for each lead. Classification runs on your machine through Ollama. Web scrapers fetch public pages from the internet.
 
-Find people with marketing pain. Classify. Score. Get rich context. No data leaves your computer.
+> The current version of RaptorFlow is [RHUDHRESH/Raptorflow](https://github.com/RHUDHRESH/Raptorflow). This repository is an earlier component.
 
-Built with:
-- **Gemma 3 1B/4B** via Ollama (classification + context generation)
-- **FastAPI** backend (local API)
-- **React/Next.js** frontend (dashboard, lead management)
-- **SQLite** database (no external dependencies)
-- **Tesseract** OCR (images + PDFs)
+**Stack:** Python (FastAPI, SQLAlchemy, SQLite), Next.js and React, Gemma 3 via Ollama, Tesseract OCR.
+
+**Quick start:** [Install and run](#install--run-5-minutes) · [Testing](#testing) · [Status](#status-mvp-ready)
+
 
 ---
 
@@ -216,9 +214,9 @@ The script checks Python, Node.js/npm, Tesseract, and the local Ollama endpoint 
 Run the 7 test workflows to verify everything works:
 
 ```bash
-# Start all 3 services first (see Quickstart above)
+# Start all 3 services first (see Quickstart below)
 
-# Then follow: docs/MANUAL_TEST_GUIDE.md
+# Then follow: MANUAL_TEST_GUIDE.md
 ```
 
 Workflows:
@@ -274,7 +272,7 @@ curl -X POST http://localhost:8000/api/ingest/ocr-and-classify \
 
 **CSV Bulk** – Upload a CSV with `company_name`, `signal_text` columns. Batch processed.
 
-**🆕 Web Scraping** – Automatically discover and collect leads from the web:
+**Web Scraping** – Automatically discover and collect leads from the web:
 
 - **Job Boards** – Scrape Indeed, Naukri, LinkedIn for job postings matching your criteria
 - **Company Websites** – Extract contact info, hiring signals, and career pages
@@ -333,11 +331,11 @@ Live overview:
 
 | Document | Purpose |
 |----------|---------|
-| [MANUAL_TEST_GUIDE.md](docs/MANUAL_TEST_GUIDE.md) | Step-by-step testing with curl commands |
-| [TESTING_CHECKLIST.md](docs/TESTING_CHECKLIST.md) | Printable checklist for each workflow |
+| [MANUAL_TEST_GUIDE.md](MANUAL_TEST_GUIDE.md) | Step-by-step testing with curl commands |
+| [TESTING_CHECKLIST.md](TESTING_CHECKLIST.md) | Printable checklist for each workflow |
 | [START_HERE.md](START_HERE.md) | Current status + next steps |
-| [PHASE_C_COMPLETE.md](docs/PHASE_C_COMPLETE.md) | Hardening & error handling improvements |
-| [WORK_SUMMARY.md](docs/WORK_SUMMARY.md) | Full work summary + timeline |
+| [PHASE_C_COMPLETE.md](PHASE_C_COMPLETE.md) | Hardening & error handling improvements |
+| [WORK_SUMMARY.md](WORK_SUMMARY.md) | Full work summary + timeline |
 
 ---
 
@@ -393,19 +391,19 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for setup and dev workflow.
 
 ## License
 
-[Add license here if applicable]
+No license file has been added yet.
 
 ---
 
-## Status: MVP Ready
+## Status: MVP ready
 
 ✅ Code complete
 ✅ Error handling hardened
 ✅ Testing framework in place
 ⏳ Awaiting test execution
 
-Next: Run [MANUAL_TEST_GUIDE.md](docs/MANUAL_TEST_GUIDE.md) to verify everything works.
+Next: Run [MANUAL_TEST_GUIDE.md](MANUAL_TEST_GUIDE.md) to verify everything works.
 
 ---
 
-**Built by Claude Code** | Local-first lead discovery engine | 100% privacy, 0% cloud
+Built by [Rhudhresh R](https://github.com/RHUDHRESH)
